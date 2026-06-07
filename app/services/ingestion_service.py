@@ -1,0 +1,217 @@
+import asyncio
+import json
+import re
+from collections.abc import Sequence
+
+import torch
+from groq import Groq
+from neo4j import AsyncDriver
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, PointStruct, VectorParams
+from sentence_transformers import SentenceTransformer
+
+from app.core.config import settings
+from app.core.database import neo4j_driver, qdrant_client
+from app.schemas.extraction import GraphExtractionResponse
+from app.services.parser_service import DocumentChunk
+
+
+class IngestionService:
+    def __init__(
+        self,
+        graph_driver: AsyncDriver = neo4j_driver,
+        vector_client: QdrantClient = qdrant_client,
+    ) -> None:
+        self.graph_driver = graph_driver
+        self.vector_client = vector_client
+        self.collection_name = settings.qdrant_collection_name
+        self.embedding_model = SentenceTransformer(
+            settings.embedding_model_name,
+            device=self._resolve_embedding_device(),
+        )
+
+    def upsert_chunks_to_qdrant(self, chunks: Sequence[DocumentChunk]) -> int:
+        if not chunks:
+            return 0
+
+        embeddings = self.embedding_model.encode(
+            [chunk.text for chunk in chunks],
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+
+        self._ensure_qdrant_collection(vector_size=len(embeddings[0]))
+
+        points = [
+            PointStruct(
+                id=self._qdrant_point_id(chunk.id),
+                vector=embedding.tolist(),
+                payload={
+                    **chunk.metadata,
+                    "text": chunk.text,
+                },
+            )
+            for chunk, embedding in zip(chunks, embeddings, strict=True)
+        ]
+        self.vector_client.upsert(collection_name=self.collection_name, points=points)
+        return len(points)
+
+    async def extract_graph_from_chunks(
+        self,
+        chunks: Sequence[DocumentChunk],
+    ) -> GraphExtractionResponse:
+        merged = GraphExtractionResponse()
+        seen_nodes: set[str] = set()
+        seen_relationships: set[tuple[str, str, str]] = set()
+
+        for chunk in chunks:
+            extracted = await self.extract_graph_from_text(chunk.text)
+            for node in extracted.nodes:
+                if node.id not in seen_nodes:
+                    merged.nodes.append(node)
+                    seen_nodes.add(node.id)
+            for relationship in extracted.relationships:
+                relationship_key = (
+                    relationship.source_node_id,
+                    relationship.target_node_id,
+                    relationship.relation_type,
+                )
+                if relationship_key not in seen_relationships:
+                    merged.relationships.append(relationship)
+                    seen_relationships.add(relationship_key)
+
+        return merged
+
+    async def extract_graph_from_text(self, text: str) -> GraphExtractionResponse:
+        provider = settings.llm_provider.lower()
+        if provider == "gemini":
+            return await asyncio.to_thread(self._extract_with_gemini, text)
+        if provider == "groq":
+            return await asyncio.to_thread(self._extract_with_groq, text)
+        raise ValueError(f"Unsupported LLM_PROVIDER: {settings.llm_provider}")
+
+    async def store_graph_extraction(self, extraction: GraphExtractionResponse) -> None:
+        async with self.graph_driver.session() as session:
+            for node in extraction.nodes:
+                await session.run(
+                    """
+                    MERGE (c:Concept {id: $id})
+                    SET c.name = $name,
+                        c.type = $type,
+                        c.description = $description
+                    """,
+                    id=node.id,
+                    name=node.name,
+                    type=node.type,
+                    description=node.description,
+                )
+
+            for relationship in extraction.relationships:
+                relation_type = self._safe_relationship_type(relationship.relation_type)
+                await session.run(
+                    f"""
+                    MATCH (source:Concept {{id: $source_node_id}})
+                    MATCH (target:Concept {{id: $target_node_id}})
+                    MERGE (source)-[r:{relation_type}]->(target)
+                    SET r.relation_type = $relation_type
+                    """,
+                    source_node_id=relationship.source_node_id,
+                    target_node_id=relationship.target_node_id,
+                    relation_type=relationship.relation_type,
+                )
+
+    async def ingest_chunks(self, chunks: Sequence[DocumentChunk]) -> dict[str, int]:
+        vector_count = self.upsert_chunks_to_qdrant(chunks)
+        graph_extraction = await self.extract_graph_from_chunks(chunks)
+        await self.store_graph_extraction(graph_extraction)
+        return {
+            "chunks_indexed": vector_count,
+            "nodes_upserted": len(graph_extraction.nodes),
+            "relationships_upserted": len(graph_extraction.relationships),
+        }
+
+    def _ensure_qdrant_collection(self, vector_size: int) -> None:
+        existing_collections = self.vector_client.get_collections().collections
+        if any(collection.name == self.collection_name for collection in existing_collections):
+            return
+
+        self.vector_client.create_collection(
+            collection_name=self.collection_name,
+            vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
+        )
+
+    def _extract_with_groq(self, text: str) -> GraphExtractionResponse:
+        if not settings.groq_api_key:
+            raise ValueError("GROQ_API_KEY is required when LLM_PROVIDER=groq")
+
+        client = Groq(api_key=settings.groq_api_key)
+        completion = client.chat.completions.create(
+            model=settings.groq_model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": self._extraction_system_prompt(),
+                },
+                {
+                    "role": "user",
+                    "content": text,
+                },
+            ],
+            temperature=0,
+            response_format={"type": "json_object"},
+        )
+        content = completion.choices[0].message.content or "{}"
+        return GraphExtractionResponse.model_validate_json(content)
+
+    def _extract_with_gemini(self, text: str) -> GraphExtractionResponse:
+        if not settings.gemini_api_key:
+            raise ValueError("GEMINI_API_KEY is required when LLM_PROVIDER=gemini")
+
+        import google.generativeai as genai
+
+        genai.configure(api_key=settings.gemini_api_key)
+        model = genai.GenerativeModel(settings.gemini_model)
+        response = model.generate_content(
+            [
+                self._extraction_system_prompt(),
+                text,
+            ],
+            generation_config={
+                "temperature": 0,
+                "response_mime_type": "application/json",
+            },
+        )
+        return GraphExtractionResponse.model_validate_json(response.text or "{}")
+
+    @staticmethod
+    def _extraction_system_prompt() -> str:
+        schema = json.dumps(GraphExtractionResponse.model_json_schema(), indent=2)
+        return (
+            "Extract academic concepts and prerequisite relationships from the text. "
+            "Return only valid JSON matching this schema. Use stable lowercase snake_case "
+            "ids for nodes. Use uppercase snake_case relationship types such as "
+            "PREREQUISITE_OF, PART_OF, EXPLAINS, or RELATED_TO.\n\n"
+            f"{schema}"
+        )
+
+    @staticmethod
+    def _resolve_embedding_device() -> str:
+        if torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
+
+    @staticmethod
+    def _safe_relationship_type(relation_type: str) -> str:
+        normalized = re.sub(r"[^A-Za-z0-9_]", "_", relation_type.upper()).strip("_")
+        if not normalized:
+            return "RELATED_TO"
+        if normalized[0].isdigit():
+            return f"RELATED_{normalized}"
+        return normalized
+
+    @staticmethod
+    def _qdrant_point_id(chunk_id: str) -> str:
+        import uuid
+
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, chunk_id))
