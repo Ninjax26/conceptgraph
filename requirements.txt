@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+celery
+redis
+neo4j
+qdrant-client
+sqlalchemy
+asyncpg
+pydantic
+pydantic-settings
+langchain
+sentence-transformers
+pymupdf

@@ -1,0 +1,54 @@
+services:
+  neo4j:
+    image: neo4j:5-community
+    platform: linux/arm64
+    container_name: conceptgraph-neo4j
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: ${NEO4J_USERNAME:-neo4j}/${NEO4J_PASSWORD:-conceptgraph_password}
+      NEO4J_dbms_memory_pagecache_size: 1G
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 1G
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - ./data/neo4j/data:/data
+      - ./data/neo4j/logs:/logs
+      - ./data/neo4j/import:/var/lib/neo4j/import
+      - ./data/neo4j/plugins:/plugins
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    platform: linux/arm64
+    container_name: conceptgraph-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+    volumes:
+      - ./data/qdrant:/qdrant/storage
+
+  postgres:
+    image: postgres:16-alpine
+    platform: linux/arm64
+    container_name: conceptgraph-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-conceptgraph}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-conceptgraph_password}
+      POSTGRES_DB: ${POSTGRES_DB:-conceptgraph}
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    platform: linux/arm64
+    container_name: conceptgraph-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./data/redis:/data
+    command: ["redis-server", "--appendonly", "yes"]
