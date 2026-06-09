@@ -2,7 +2,7 @@ import asyncio
 from functools import lru_cache
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.services.rag_service import RetrievalService
@@ -45,18 +45,27 @@ def get_synthesis_service() -> SynthesisService:
 async def query_conceptgraph(
     request: QueryRequest,
     retrieval_service: RetrievalService = Depends(get_retrieval_service),
-    rerank_service: RerankService = Depends(get_rerank_service),
-    synthesis_service: SynthesisService = Depends(get_synthesis_service),
 ) -> QueryResponse:
     retrieval_result = await retrieval_service.retrieve(
         question=request.question,
         course_id=request.course_id,
     )
+    if not retrieval_result["chunks"]:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                "No syllabus data found for this course. Please upload and process "
+                "a document before querying ConceptGraph."
+            ),
+        )
+
+    rerank_service = get_rerank_service()
     ranked_chunks = await asyncio.to_thread(
         rerank_service.rerank,
         request.question,
         retrieval_result["chunks"],
     )
+    synthesis_service = get_synthesis_service()
     answer = await synthesis_service.synthesize(
         question=request.question,
         graph_context=retrieval_result["graph_context"],

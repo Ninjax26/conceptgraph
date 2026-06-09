@@ -15,3 +15,8 @@ data/
 .ruff_cache/
 
 *.log
+
+node_modules/
+dist/
+.vite/
+.aider*

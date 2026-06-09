@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -14,6 +15,8 @@ from sentence_transformers import SentenceTransformer
 
 from app.core.config import settings
 from app.core.database import neo4j_driver, qdrant_client
+
+logger = logging.getLogger(__name__)
 
 
 class CypherGenerationResponse(BaseModel):
@@ -39,10 +42,7 @@ class RetrievalService:
         self.graph_driver = graph_driver
         self.vector_client = vector_client
         self.collection_name = settings.qdrant_collection_name
-        self.embedding_model = SentenceTransformer(
-            settings.embedding_model_name,
-            device=self._resolve_embedding_device(),
-        )
+        self._embedding_model: SentenceTransformer | None = None
 
     async def retrieve(
         self,
@@ -110,6 +110,10 @@ class RetrievalService:
         course_id: str,
         top_k: int = 10,
     ) -> list[dict[str, Any]]:
+        if not self._collection_exists():
+            logger.info("Qdrant collection %s does not exist yet.", self.collection_name)
+            return []
+
         expanded_query = self._build_expanded_query(question, prerequisite_names)
         query_vector = self.embedding_model.encode(
             expanded_query,
@@ -159,6 +163,31 @@ class RetrievalService:
                 }
             )
         return chunks
+
+    @property
+    def embedding_model(self) -> SentenceTransformer:
+        if self._embedding_model is None:
+            self._embedding_model = SentenceTransformer(
+                settings.embedding_model_name,
+                device=self._resolve_embedding_device(),
+            )
+        return self._embedding_model
+
+    def _collection_exists(self) -> bool:
+        try:
+            return bool(
+                self.vector_client.collection_exists(
+                    collection_name=self.collection_name,
+                )
+            )
+        except AttributeError:
+            try:
+                self.vector_client.get_collection(collection_name=self.collection_name)
+            except Exception as exc:
+                if "not found" in str(exc).lower() or "404" in str(exc):
+                    return False
+                raise
+            return True
 
     def _generate_cypher_with_groq(self, question: str) -> CypherGenerationResponse:
         if not settings.groq_api_key:

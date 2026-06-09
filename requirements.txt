@@ -8,6 +8,7 @@ sqlalchemy
 asyncpg
 pydantic
 pydantic-settings
+python-multipart
 langchain
 langchain-text-splitters
 sentence-transformers

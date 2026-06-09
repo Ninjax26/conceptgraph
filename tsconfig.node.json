@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "skipLibCheck": true,
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./src/*"]
+    },
+    "allowSyntheticDefaultImports": true,
+    "strict": true,
+    "noEmit": true
+  },
+  "include": ["vite.config.ts", "tailwind.config.ts"]
+}
