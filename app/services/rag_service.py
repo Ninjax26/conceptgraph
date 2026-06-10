@@ -50,7 +50,10 @@ class RetrievalService:
         course_id: str,
         top_k: int = 10,
     ) -> dict[str, Any]:
-        graph_result = await self.execute_graph_retrieval(question=question)
+        graph_result = await self.execute_graph_retrieval(
+            question=question,
+            course_id=course_id,
+        )
         chunks = await asyncio.to_thread(
             self.search_qdrant,
             question,
@@ -64,14 +67,29 @@ class RetrievalService:
             "chunks": chunks,
         }
 
-    async def execute_graph_retrieval(self, question: str) -> GraphRetrievalResult:
-        generated = await self.generate_cypher(question)
-        cypher = self._validate_read_only_cypher(generated.cypher)
-        parameters = {**generated.parameters, "question": question}
+    async def execute_graph_retrieval(
+        self,
+        question: str,
+        course_id: str,
+    ) -> GraphRetrievalResult:
+        try:
+            generated = await self.generate_cypher(question)
+            cypher = self._validate_read_only_cypher(generated.cypher)
+            if "$course_id" not in cypher:
+                generated = self._fallback_cypher(question)
+                cypher = self._validate_read_only_cypher(generated.cypher)
+        except Exception as exc:
+            logger.warning("Falling back to local course-scoped Cypher: %s", exc)
+            generated = self._fallback_cypher(question)
+            cypher = self._validate_read_only_cypher(generated.cypher)
+        parameters = {**generated.parameters, "question": question, "course_id": course_id}
 
         async with self.graph_driver.session() as session:
             result = await session.run(cypher, parameters)
             records = await result.data()
+
+            if not records:
+                records = await self._fetch_course_graph(session, course_id)
 
         concepts: list[dict[str, Any]] = []
         prerequisite_names: list[str] = []
@@ -228,7 +246,10 @@ class RetrievalService:
         schema = json.dumps(CypherGenerationResponse.model_json_schema(), indent=2)
         return (
             "Generate a single read-only Neo4j Cypher query for an academic concept graph. "
-            "The graph uses (:Concept {id, name, type, description}) nodes. "
+            "The graph uses (:Course {id}) nodes connected to "
+            "(:Concept {id, name, type, description}) nodes by [:CONTAINS]. "
+            "Always scope the query to MATCH (course:Course {id: $course_id}) and only "
+            "return concepts contained by that course. "
             "The query must return a variable named concept and a variable named prerequisites. "
             "prerequisites must contain prerequisite Concept nodes up to 2 hops away. "
             "Use parameters instead of interpolating user text. Do not write, merge, delete, "
@@ -245,9 +266,10 @@ class RetrievalService:
         ][:12]
         return CypherGenerationResponse(
             cypher="""
-            MATCH (concept:Concept)
+            MATCH (course:Course {id: $course_id})-[:CONTAINS]->(concept:Concept)
             WHERE any(term IN $terms WHERE toLower(concept.name) CONTAINS term)
             OPTIONAL MATCH (prerequisite:Concept)-[*1..2]->(concept)
+            WHERE prerequisite IS NULL OR (course)-[:CONTAINS]->(prerequisite)
             RETURN concept, collect(DISTINCT prerequisite) AS prerequisites
             LIMIT 5
             """,
@@ -279,6 +301,24 @@ class RetrievalService:
             return question
         graph_terms = " ".join(prerequisite_names)
         return f"{question}\nRelevant prerequisite concepts: {graph_terms}"
+
+    async def _fetch_course_graph(
+        self,
+        session,
+        course_id: str,
+    ) -> list[dict[str, Any]]:
+        result = await session.run(
+            """
+            MATCH (course:Course {id: $course_id})-[:CONTAINS]->(concept:Concept)
+            OPTIONAL MATCH (prerequisite:Concept)-[*1..2]->(concept)
+            WHERE prerequisite IS NULL OR (course)-[:CONTAINS]->(prerequisite)
+            RETURN concept, collect(DISTINCT prerequisite) AS prerequisites
+            ORDER BY concept.name
+            LIMIT 50
+            """,
+            course_id=course_id,
+        )
+        return await result.data()
 
     @staticmethod
     def _resolve_embedding_device() -> str:

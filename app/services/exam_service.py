@@ -16,6 +16,7 @@ from qdrant_client.models import FieldCondition, Filter, MatchValue, ScrollReque
 
 from app.core.config import settings
 from app.core.database import qdrant_client as default_qdrant_client
+from app.core.exceptions import LLMConfigurationError
 from app.schemas.exam import ExamResponse, MockQuestion
 
 logger = logging.getLogger(__name__)
@@ -207,7 +208,7 @@ class ExamService:
         num_questions: int,
     ) -> list[MockQuestion]:
         if not settings.groq_api_key:
-            raise ValueError("GROQ_API_KEY is required when LLM_PROVIDER=groq")
+            raise LLMConfigurationError("GROQ_API_KEY is required when LLM_PROVIDER=groq")
 
         client = Groq(api_key=settings.groq_api_key)
         completion = client.chat.completions.create(
@@ -229,7 +230,7 @@ class ExamService:
         num_questions: int,
     ) -> list[MockQuestion]:
         if not settings.gemini_api_key:
-            raise ValueError("GEMINI_API_KEY is required when LLM_PROVIDER=gemini")
+            raise LLMConfigurationError("GEMINI_API_KEY is required when LLM_PROVIDER=gemini")
 
         import google.generativeai as genai
 

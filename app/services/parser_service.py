@@ -35,11 +35,22 @@ class ParserService:
 
         return "\n\n".join(page_text)
 
-    def parse_and_chunk(self, file_path: str, document_id: str) -> list[DocumentChunk]:
+    def parse_and_chunk(
+        self,
+        file_path: str,
+        document_id: str,
+        week_number: int = 1,
+    ) -> list[DocumentChunk]:
         text = self.extract_text(file_path)
         raw_chunks = self.text_splitter.create_documents(
             texts=[text],
-            metadatas=[{"document_id": document_id, "source_path": file_path}],
+            metadatas=[
+                {
+                    "document_id": document_id,
+                    "source_path": file_path,
+                    "week": week_number,
+                }
+            ],
         )
 
         chunks: list[DocumentChunk] = []
@@ -54,6 +65,7 @@ class ParserService:
                         "chunk_index": index,
                         "document_id": document_id,
                         "source_path": file_path,
+                        "week": week_number,
                     },
                 )
             )

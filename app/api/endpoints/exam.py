@@ -5,6 +5,7 @@ from functools import lru_cache
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.core.exceptions import LLMConfigurationError
 from app.schemas.exam import ExamResponse
 from app.services.exam_service import ExamService
 
@@ -52,6 +53,11 @@ async def generate_exam(
             week_number=request.week_number,
             num_questions=request.num_questions,
         )
+    except LLMConfigurationError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"LLM provider is not configured: {exc}",
+        ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:

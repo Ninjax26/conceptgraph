@@ -12,6 +12,7 @@ from sentence_transformers import SentenceTransformer
 
 from app.core.config import settings
 from app.core.database import neo4j_driver, qdrant_client
+from app.core.exceptions import LLMConfigurationError
 from app.schemas.extraction import GraphExtractionResponse
 from app.services.parser_service import DocumentChunk
 
@@ -25,10 +26,7 @@ class IngestionService:
         self.graph_driver = graph_driver
         self.vector_client = vector_client
         self.collection_name = settings.qdrant_collection_name
-        self.embedding_model = SentenceTransformer(
-            settings.embedding_model_name,
-            device=self._resolve_embedding_device(),
-        )
+        self._embedding_model: SentenceTransformer | None = None
 
     def upsert_chunks_to_qdrant(self, chunks: Sequence[DocumentChunk]) -> int:
         if not chunks:
@@ -56,6 +54,15 @@ class IngestionService:
         ]
         self.vector_client.upsert(collection_name=self.collection_name, points=points)
         return len(points)
+
+    @property
+    def embedding_model(self) -> SentenceTransformer:
+        if self._embedding_model is None:
+            self._embedding_model = SentenceTransformer(
+                settings.embedding_model_name,
+                device=self._resolve_embedding_device(),
+            )
+        return self._embedding_model
 
     async def extract_graph_from_chunks(
         self,
@@ -91,40 +98,72 @@ class IngestionService:
             return await asyncio.to_thread(self._extract_with_groq, text)
         raise ValueError(f"Unsupported LLM_PROVIDER: {settings.llm_provider}")
 
-    async def store_graph_extraction(self, extraction: GraphExtractionResponse) -> None:
+    async def store_graph_extraction(
+        self,
+        extraction: GraphExtractionResponse,
+        course_id: str,
+    ) -> None:
         async with self.graph_driver.session() as session:
+            await session.run(
+                """
+                MERGE (course:Course {id: $course_id})
+                SET course.updated_at = datetime()
+                """,
+                course_id=course_id,
+            )
+
             for node in extraction.nodes:
                 await session.run(
                     """
                     MERGE (c:Concept {id: $id})
                     SET c.name = $name,
                         c.type = $type,
-                        c.description = $description
+                        c.description = $description,
+                        c.source_id = $source_id,
+                        c.course_id = $course_id
+                    WITH c
+                    MATCH (course:Course {id: $course_id})
+                    MERGE (course)-[:CONTAINS]->(c)
                     """,
-                    id=node.id,
+                    id=self._scoped_concept_id(course_id, node.id),
+                    source_id=node.id,
                     name=node.name,
                     type=node.type,
                     description=node.description,
+                    course_id=course_id,
                 )
 
             for relationship in extraction.relationships:
                 relation_type = self._safe_relationship_type(relationship.relation_type)
                 await session.run(
                     f"""
+                    MATCH (course:Course {{id: $course_id}})
                     MATCH (source:Concept {{id: $source_node_id}})
                     MATCH (target:Concept {{id: $target_node_id}})
-                    MERGE (source)-[r:{relation_type}]->(target)
-                    SET r.relation_type = $relation_type
+                    MATCH (course)-[:CONTAINS]->(source)
+                    MATCH (course)-[:CONTAINS]->(target)
+                    MERGE (source)-[r:{relation_type} {{course_id: $course_id}}]->(target)
+                    SET r.relation_type = $relation_type,
+                        r.course_id = $course_id
                     """,
-                    source_node_id=relationship.source_node_id,
-                    target_node_id=relationship.target_node_id,
+                    course_id=course_id,
+                    source_node_id=self._scoped_concept_id(
+                        course_id,
+                        relationship.source_node_id,
+                    ),
+                    target_node_id=self._scoped_concept_id(
+                        course_id,
+                        relationship.target_node_id,
+                    ),
                     relation_type=relationship.relation_type,
                 )
 
     async def ingest_chunks(self, chunks: Sequence[DocumentChunk]) -> dict[str, int]:
+        self._validate_llm_configured()
+        course_id = self._course_id_from_chunks(chunks)
         vector_count = self.upsert_chunks_to_qdrant(chunks)
         graph_extraction = await self.extract_graph_from_chunks(chunks)
-        await self.store_graph_extraction(graph_extraction)
+        await self.store_graph_extraction(graph_extraction, course_id=course_id)
         return {
             "chunks_indexed": vector_count,
             "nodes_upserted": len(graph_extraction.nodes),
@@ -143,7 +182,7 @@ class IngestionService:
 
     def _extract_with_groq(self, text: str) -> GraphExtractionResponse:
         if not settings.groq_api_key:
-            raise ValueError("GROQ_API_KEY is required when LLM_PROVIDER=groq")
+            raise LLMConfigurationError("GROQ_API_KEY is required when LLM_PROVIDER=groq")
 
         client = Groq(api_key=settings.groq_api_key)
         completion = client.chat.completions.create(
@@ -166,7 +205,7 @@ class IngestionService:
 
     def _extract_with_gemini(self, text: str) -> GraphExtractionResponse:
         if not settings.gemini_api_key:
-            raise ValueError("GEMINI_API_KEY is required when LLM_PROVIDER=gemini")
+            raise LLMConfigurationError("GEMINI_API_KEY is required when LLM_PROVIDER=gemini")
 
         import google.generativeai as genai
 
@@ -202,6 +241,14 @@ class IngestionService:
         return "cpu"
 
     @staticmethod
+    def _validate_llm_configured() -> None:
+        provider = settings.llm_provider.lower()
+        if provider == "groq" and not settings.groq_api_key:
+            raise LLMConfigurationError("GROQ_API_KEY is required when LLM_PROVIDER=groq")
+        if provider == "gemini" and not settings.gemini_api_key:
+            raise LLMConfigurationError("GEMINI_API_KEY is required when LLM_PROVIDER=gemini")
+
+    @staticmethod
     def _safe_relationship_type(relation_type: str) -> str:
         normalized = re.sub(r"[^A-Za-z0-9_]", "_", relation_type.upper()).strip("_")
         if not normalized:
@@ -215,3 +262,17 @@ class IngestionService:
         import uuid
 
         return str(uuid.uuid5(uuid.NAMESPACE_URL, chunk_id))
+
+    @staticmethod
+    def _course_id_from_chunks(chunks: Sequence[DocumentChunk]) -> str:
+        if not chunks:
+            raise ValueError("Cannot ingest an empty chunk list.")
+
+        course_id = chunks[0].metadata.get("document_id")
+        if not isinstance(course_id, str) or not course_id.strip():
+            raise ValueError("Chunk metadata must include a non-empty document_id.")
+        return course_id
+
+    @staticmethod
+    def _scoped_concept_id(course_id: str, concept_id: str) -> str:
+        return f"{course_id}:{concept_id}"

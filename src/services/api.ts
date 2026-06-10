@@ -121,15 +121,18 @@ export interface IngestResponse {
   message: string;
   task_id: string;
   course_id: string;
+  week_number: number;
 }
 
 export async function uploadDocument(
   file: File,
-  courseId: string
+  courseId: string,
+  weekNumber = 1,
 ): Promise<IngestResponse> {
   const formData = new FormData();
   formData.append("file", file);
   formData.append("course_id", courseId);
+  formData.append("week_number", String(weekNumber));
 
   const response = await fetchWithTimeout(`${API_BASE_URL}/ingest/upload`, {
     method: "POST",

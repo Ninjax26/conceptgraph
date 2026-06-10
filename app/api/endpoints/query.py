@@ -5,6 +5,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.core.exceptions import LLMConfigurationError
 from app.services.rag_service import RetrievalService
 from app.services.rerank_service import RerankService
 from app.services.synthesis_service import SynthesisService
@@ -46,6 +47,15 @@ async def query_conceptgraph(
     request: QueryRequest,
     retrieval_service: RetrievalService = Depends(get_retrieval_service),
 ) -> QueryResponse:
+    synthesis_service = get_synthesis_service()
+    try:
+        synthesis_service.validate_provider_configured()
+    except LLMConfigurationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"LLM provider is not configured: {exc}",
+        ) from exc
+
     retrieval_result = await retrieval_service.retrieve(
         question=request.question,
         course_id=request.course_id,
@@ -65,12 +75,17 @@ async def query_conceptgraph(
         request.question,
         retrieval_result["chunks"],
     )
-    synthesis_service = get_synthesis_service()
-    answer = await synthesis_service.synthesize(
-        question=request.question,
-        graph_context=retrieval_result["graph_context"],
-        ranked_chunks=ranked_chunks,
-    )
+    try:
+        answer = await synthesis_service.synthesize(
+            question=request.question,
+            graph_context=retrieval_result["graph_context"],
+            ranked_chunks=ranked_chunks,
+        )
+    except LLMConfigurationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"LLM provider is not configured: {exc}",
+        ) from exc
 
     return QueryResponse(
         answer=answer,

@@ -4,15 +4,24 @@ from typing import Any
 from groq import Groq
 
 from app.core.config import settings
+from app.core.exceptions import LLMConfigurationError
 
 
 class SynthesisService:
+    def validate_provider_configured(self) -> None:
+        provider = settings.llm_provider.lower()
+        if provider == "groq" and not settings.groq_api_key:
+            raise LLMConfigurationError("GROQ_API_KEY is required when LLM_PROVIDER=groq")
+        if provider == "gemini" and not settings.gemini_api_key:
+            raise LLMConfigurationError("GEMINI_API_KEY is required when LLM_PROVIDER=gemini")
+
     async def synthesize(
         self,
         question: str,
         graph_context: list[dict[str, Any]],
         ranked_chunks: list[dict[str, Any]],
     ) -> str:
+        self.validate_provider_configured()
         top_chunks = ranked_chunks[:4]
         provider = settings.llm_provider.lower()
         if provider == "gemini":
@@ -37,9 +46,6 @@ class SynthesisService:
         graph_context: list[dict[str, Any]],
         chunks: list[dict[str, Any]],
     ) -> str:
-        if not settings.groq_api_key:
-            raise ValueError("GROQ_API_KEY is required when LLM_PROVIDER=groq")
-
         client = Groq(api_key=settings.groq_api_key)
         completion = client.chat.completions.create(
             model=settings.groq_model,
@@ -57,9 +63,6 @@ class SynthesisService:
         graph_context: list[dict[str, Any]],
         chunks: list[dict[str, Any]],
     ) -> str:
-        if not settings.gemini_api_key:
-            raise ValueError("GEMINI_API_KEY is required when LLM_PROVIDER=gemini")
-
         import google.generativeai as genai
 
         genai.configure(api_key=settings.gemini_api_key)
