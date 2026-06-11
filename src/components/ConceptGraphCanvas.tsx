@@ -2,6 +2,8 @@ import cytoscape, {
   type Core,
   type EdgeDefinition,
   type NodeDefinition,
+  type NodeSingular,
+  type EdgeSingular,
 } from "cytoscape";
 import { useEffect, useRef } from "react";
 
@@ -117,16 +119,64 @@ export default function ConceptGraphCanvas({
     cy.userPanningEnabled(true);
     cy.nodes().grabify();
 
-    cy.on("tap", "node", (event) => {
-      const selected = event.target;
-      const outgoingEdges = selected.outgoers("edge");
-      const outgoingNodes = selected.outgoers("node");
+    cy.on("tap", "node", async (event) => {
+      const selected = event.target as NodeSingular;
 
+      // Reset and dim everything first
       cy.elements().removeClass("selectedPath dimmed");
       cy.elements().addClass("dimmed");
-      selected.removeClass("dimmed").addClass("selectedPath");
-      outgoingEdges.removeClass("dimmed").addClass("selectedPath");
-      outgoingNodes.removeClass("dimmed").addClass("selectedPath");
+
+      // Animated traversal: follow the first outgoing link repeatedly
+      // This makes linear prerequisite chains feel alive.
+      try {
+        const maxSteps = 50;
+        let current: NodeSingular | null = selected;
+
+        // mark start node
+        current.removeClass("dimmed").addClass("selectedPath");
+
+        for (let step = 0; step < maxSteps && current; step++) {
+          const outEdges = current.outgoers("edge");
+          if (outEdges.length === 0) break;
+
+          // Prefer an edge that leads to an unvisited node
+          let edge = (outEdges.filter((e) => !( (e as EdgeSingular).target().hasClass("selectedPath") ))[0] ?? outEdges[0]) as EdgeSingular;
+          const targetNode = edge.target() as NodeSingular;
+
+          // reveal and animate the edge
+          edge.removeClass("dimmed");
+          await new Promise<void>((resolve) => {
+            // Use any cast because animate options typing varies between versions
+            (edge as any).animate(
+              {
+                style: {
+                  "line-color": "#0d9488",
+                  "target-arrow-color": "#0d9488",
+                  width: 4,
+                },
+              },
+              { duration: 400, complete: () => resolve() }
+            );
+          });
+
+          // lock-in selected style on edge and reveal the node
+          edge.addClass("selectedPath");
+          targetNode.removeClass("dimmed").addClass("selectedPath");
+
+          // small pause before continuing to next hop
+          await new Promise((r) => setTimeout(r, 150));
+
+          // advance
+          current = targetNode;
+        }
+      } catch (err) {
+        // Fallback: instant highlight if animation fails
+        const outgoingEdges = selected.outgoers("edge");
+        const outgoingNodes = selected.outgoers("node");
+        selected.removeClass("dimmed").addClass("selectedPath");
+        outgoingEdges.removeClass("dimmed").addClass("selectedPath");
+        outgoingNodes.removeClass("dimmed").addClass("selectedPath");
+      }
     });
 
     cy.on("tap", (event) => {
