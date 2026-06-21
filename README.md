@@ -2,6 +2,10 @@
 
 ConceptGraph is an AI-powered academic knowledge graph and GraphRAG pipeline for dense course materials. It ingests syllabi, essays, and textbooks, isolates them by course boundary, and turns them into a searchable concept graph plus a syllabus-bounded retrieval and exam workflow.
 
+## Preview
+
+![ConceptGraph dashboard preview](public/dashboard-preview.jpeg)
+
 ## What It Does
 
 - Parses PDFs asynchronously through Celery so large files do not block the API.
@@ -181,4 +185,3 @@ Open the app at `http://127.0.0.1:5173`.
 - The Neo4j graph is course-scoped to avoid mixing unrelated syllabi.
 - `week_number` is required for syllabus-bounded exam generation.
 - The project is optimized for local development on Apple Silicon.
-
