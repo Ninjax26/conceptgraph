@@ -1,13 +1,18 @@
 import { FormEvent, useRef, useState } from "react";
 import { FileUp, Loader2, X } from "lucide-react";
-import { uploadDocument } from "../services/api";
+import { IngestResponse, uploadDocument } from "../services/api";
 
 interface UploadModalProps {
   isOpen: boolean;
   onClose: () => void;
+  onUploaded?: (upload: IngestResponse) => void;
 }
 
-export default function UploadModal({ isOpen, onClose }: UploadModalProps): JSX.Element | null {
+export default function UploadModal({
+  isOpen,
+  onClose,
+  onUploaded,
+}: UploadModalProps): JSX.Element | null {
   const [courseId, setCourseId] = useState("");
   const [weekNumber, setWeekNumber] = useState(1);
   const [file, setFile] = useState<File | null>(null);
@@ -48,6 +53,7 @@ export default function UploadModal({ isOpen, onClose }: UploadModalProps): JSX.
 
     try {
       const res = await uploadDocument(file, courseId.trim(), weekNumber);
+      onUploaded?.(res);
       setMessage({ text: res.message || "Background processing has started.", type: "success" });
       setTimeout(() => {
         onClose();

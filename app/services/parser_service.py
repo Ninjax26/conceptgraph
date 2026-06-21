@@ -39,36 +39,50 @@ class ParserService:
         self,
         file_path: str,
         document_id: str,
+        upload_id: str,
         week_number: int = 1,
     ) -> list[DocumentChunk]:
-        text = self.extract_text(file_path)
-        raw_chunks = self.text_splitter.create_documents(
-            texts=[text],
-            metadatas=[
-                {
-                    "document_id": document_id,
-                    "source_path": file_path,
-                    "week": week_number,
-                }
-            ],
-        )
-
         chunks: list[DocumentChunk] = []
-        for index, chunk in enumerate(raw_chunks):
-            chunk_id = f"{document_id}:{index}"
-            chunks.append(
-                DocumentChunk(
-                    id=chunk_id,
-                    text=chunk.page_content,
-                    metadata={
-                        "chunk_id": chunk_id,
-                        "chunk_index": index,
-                        "document_id": document_id,
-                        "source_path": file_path,
-                        "week": week_number,
-                    },
+        pdf_path = Path(file_path)
+        if not pdf_path.exists():
+            raise FileNotFoundError(f"PDF file not found: {file_path}")
+
+        with fitz.open(pdf_path) as document:
+            for page_index, page in enumerate(document, start=1):
+                text = page.get_text("text").strip()
+                if not text:
+                    continue
+
+                raw_chunks = self.text_splitter.create_documents(
+                    texts=[text],
+                    metadatas=[
+                        {
+                            "document_id": document_id,
+                            "upload_id": upload_id,
+                            "source_path": file_path,
+                            "page_number": page_index,
+                            "week": week_number,
+                        }
+                    ],
                 )
-            )
+
+                for index, chunk in enumerate(raw_chunks):
+                    chunk_id = f"{upload_id}:{page_index}:{index}"
+                    chunks.append(
+                        DocumentChunk(
+                            id=chunk_id,
+                            text=chunk.page_content,
+                            metadata={
+                                "chunk_id": chunk_id,
+                                "chunk_index": index,
+                                "document_id": document_id,
+                                "upload_id": upload_id,
+                                "source_path": file_path,
+                                "page_number": page_index,
+                                "week": week_number,
+                            },
+                        )
+                    )
 
         return chunks
 

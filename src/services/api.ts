@@ -30,7 +30,8 @@ export interface QueryResponse {
   graph_context: GraphContextItem[];
 }
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000/api/v1";
+export const API_BASE_URL =
+  import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000/api/v1";
 
 async function fetchWithTimeout(url: string, options: RequestInit & { timeout?: number } = {}) {
   const { timeout = 30000 } = options;
@@ -122,8 +123,12 @@ export async function generateExam(
 export interface IngestResponse {
   message: string;
   task_id: string;
+  upload_id: string;
   course_id: string;
   week_number: number;
+  original_filename: string;
+  status: "queued";
+  preview_url: string;
 }
 
 export async function uploadDocument(
@@ -143,4 +148,29 @@ export async function uploadDocument(
   });
 
   return response.json() as Promise<IngestResponse>;
+}
+
+export interface UploadStatusResponse {
+  upload_id: string;
+  task_id: string;
+  course_id: string;
+  week_number: number;
+  original_filename: string;
+  status: "queued" | "running" | "completed" | "failed";
+  error_message?: string | null;
+  result_json?: Record<string, unknown> | null;
+  created_at: string;
+  updated_at: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  preview_url: string;
+}
+
+export async function getUploadStatus(taskId: string): Promise<UploadStatusResponse> {
+  const response = await fetchWithTimeout(`${API_BASE_URL}/ingest/status/${taskId}`, {
+    method: "GET",
+    timeout: 15000,
+  });
+
+  return response.json() as Promise<UploadStatusResponse>;
 }

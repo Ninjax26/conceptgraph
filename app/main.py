@@ -7,13 +7,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.endpoints.exam import router as exam_router
 from app.api.endpoints.ingest import router as ingest_router
 from app.api.endpoints.query import router as query_router
-from app.core.database import close_database_connections
+from app.core.database import close_database_connections, initialize_database_schema
 
 LOCAL_DEV_ORIGIN_REGEX = r"https?://(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?$"
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    await initialize_database_schema()
     yield
     await close_database_connections()
 

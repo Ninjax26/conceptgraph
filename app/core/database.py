@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from app.core.config import settings
+from app.models.document_upload import Base
 
 
 @dataclass(slots=True)
@@ -51,6 +52,11 @@ async def get_db() -> AsyncGenerator[DatabaseClients, None]:
             neo4j=neo4j_driver,
             qdrant=qdrant_client,
         )
+
+
+async def initialize_database_schema() -> None:
+    async with postgres_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 
 
 async def close_database_connections() -> None:

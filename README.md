@@ -13,6 +13,8 @@ ConceptGraph is an AI-powered academic knowledge graph and GraphRAG pipeline for
 - Extracts concepts and prerequisite relationships into Neo4j.
 - Uses hybrid retrieval to combine graph traversal, vector search, reranking, and LLM synthesis.
 - Generates syllabus-bounded mock exams using week-level metadata.
+- Tracks PDF ingestion status in real time through Celery-backed upload records.
+- Opens source citations with page-aware PDF previews in the dashboard.
 - Renders an interactive concept map in the React dashboard.
 
 ## Architecture
@@ -177,6 +179,8 @@ Open the app at `http://127.0.0.1:5173`.
 ## API Endpoints
 
 - `POST /api/v1/ingest/upload`
+- `GET /api/v1/ingest/status/{task_id}`
+- `GET /api/v1/ingest/uploads/{upload_id}/preview`
 - `POST /api/v1/query`
 - `POST /api/v1/exam/generate`
 
