@@ -14,6 +14,7 @@ const DEFAULT_COURSE_ID = "default-course";
 export default function Dashboard(): JSX.Element {
   const [question, setQuestion] = useState("");
   const [courseId, setCourseId] = useState(DEFAULT_COURSE_ID);
+  const [weekNumber, setWeekNumber] = useState(1);
   const [response, setResponse] = useState<QueryResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -26,7 +27,7 @@ export default function Dashboard(): JSX.Element {
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
-    if (!question.trim() || !courseId.trim()) {
+    if (!question.trim() || !courseId.trim() || weekNumber < 1) {
       return;
     }
 
@@ -34,7 +35,7 @@ export default function Dashboard(): JSX.Element {
     setError(null);
 
     try {
-      const result = await sendQuery(question.trim(), courseId.trim());
+      const result = await sendQuery(question.trim(), courseId.trim(), weekNumber);
       setResponse(result);
     } catch (requestError) {
       setError(
@@ -62,6 +63,16 @@ export default function Dashboard(): JSX.Element {
               />
             </label>
             <label className="block text-xs font-semibold uppercase tracking-wide text-slate-500">
+              Week Number
+              <input
+                className="mt-1 h-10 w-full rounded-md border border-slate-300 px-3 text-sm font-medium text-ink outline-none transition focus:border-signal focus:ring-2 focus:ring-teal-100"
+                type="number"
+                min={1}
+                value={weekNumber}
+                onChange={(event) => setWeekNumber(Number(event.target.value))}
+              />
+            </label>
+            <label className="block text-xs font-semibold uppercase tracking-wide text-slate-500">
               Student Question
               <textarea
                 className="mt-1 min-h-28 w-full resize-none rounded-md border border-slate-300 px-3 py-2 text-sm leading-6 text-ink outline-none transition focus:border-signal focus:ring-2 focus:ring-teal-100"
@@ -72,7 +83,7 @@ export default function Dashboard(): JSX.Element {
             <button
               className="inline-flex h-10 w-full items-center justify-center gap-2 rounded-md bg-ink px-4 text-sm font-semibold text-white transition hover:bg-slate-700 disabled:cursor-not-allowed disabled:bg-slate-400"
               type="submit"
-              disabled={isLoading || !question.trim() || !courseId.trim()}
+              disabled={isLoading || !question.trim() || !courseId.trim() || weekNumber < 1}
             >
               {isLoading ? (
                 <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />

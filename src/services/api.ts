@@ -67,6 +67,7 @@ async function fetchWithTimeout(url: string, options: RequestInit & { timeout?: 
 export async function sendQuery(
   question: string,
   courseId: string,
+  weekNumber: number,
 ): Promise<QueryResponse> {
   const response = await fetchWithTimeout(`${API_BASE_URL}/query`, {
     method: "POST",
@@ -76,6 +77,7 @@ export async function sendQuery(
     body: JSON.stringify({
       question,
       course_id: courseId,
+      week_number: weekNumber,
     }),
     timeout: 60000, // 60s timeout for LLM synthesis
   });

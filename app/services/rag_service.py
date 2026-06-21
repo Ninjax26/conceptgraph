@@ -48,17 +48,20 @@ class RetrievalService:
         self,
         question: str,
         course_id: str,
+        week_number: int,
         top_k: int = 10,
     ) -> dict[str, Any]:
         graph_result = await self.execute_graph_retrieval(
             question=question,
             course_id=course_id,
+            week_number=week_number,
         )
         chunks = await asyncio.to_thread(
             self.search_qdrant,
             question,
             graph_result.prerequisite_names,
             course_id,
+            week_number,
             top_k,
         )
         return {
@@ -71,25 +74,31 @@ class RetrievalService:
         self,
         question: str,
         course_id: str,
+        week_number: int,
     ) -> GraphRetrievalResult:
         try:
-            generated = await self.generate_cypher(question)
+            generated = await self.generate_cypher(question, week_number)
             cypher = self._validate_read_only_cypher(generated.cypher)
-            if "$course_id" not in cypher:
-                generated = self._fallback_cypher(question)
+            if "$course_id" not in cypher or "$week_number" not in cypher:
+                generated = self._fallback_cypher(question, week_number)
                 cypher = self._validate_read_only_cypher(generated.cypher)
         except Exception as exc:
             logger.warning("Falling back to local course-scoped Cypher: %s", exc)
-            generated = self._fallback_cypher(question)
+            generated = self._fallback_cypher(question, week_number)
             cypher = self._validate_read_only_cypher(generated.cypher)
-        parameters = {**generated.parameters, "question": question, "course_id": course_id}
+        parameters = {
+            **generated.parameters,
+            "question": question,
+            "course_id": course_id,
+            "week_number": week_number,
+        }
 
         async with self.graph_driver.session() as session:
             result = await session.run(cypher, parameters)
             records = await result.data()
 
             if not records:
-                records = await self._fetch_course_graph(session, course_id)
+                records = await self._fetch_course_graph(session, course_id, week_number)
 
         concepts: list[dict[str, Any]] = []
         prerequisite_names: list[str] = []
@@ -113,12 +122,20 @@ class RetrievalService:
             cypher=cypher,
         )
 
-    async def generate_cypher(self, question: str) -> CypherGenerationResponse:
+    async def generate_cypher(self, question: str, week_number: int) -> CypherGenerationResponse:
         provider = settings.llm_provider.lower()
         if provider == "gemini":
-            return await asyncio.to_thread(self._generate_cypher_with_gemini, question)
+            return await asyncio.to_thread(
+                self._generate_cypher_with_gemini,
+                question,
+                week_number,
+            )
         if provider == "groq":
-            return await asyncio.to_thread(self._generate_cypher_with_groq, question)
+            return await asyncio.to_thread(
+                self._generate_cypher_with_groq,
+                question,
+                week_number,
+            )
         raise ValueError(f"Unsupported LLM_PROVIDER: {settings.llm_provider}")
 
     def search_qdrant(
@@ -126,6 +143,7 @@ class RetrievalService:
         question: str,
         prerequisite_names: list[str],
         course_id: str,
+        week_number: int,
         top_k: int = 10,
     ) -> list[dict[str, Any]]:
         if not self._collection_exists():
@@ -144,6 +162,10 @@ class RetrievalService:
                 FieldCondition(
                     key="document_id",
                     match=MatchValue(value=course_id),
+                ),
+                FieldCondition(
+                    key="week",
+                    match=MatchValue(value=week_number),
                 )
             ]
         )
@@ -207,9 +229,13 @@ class RetrievalService:
                 raise
             return True
 
-    def _generate_cypher_with_groq(self, question: str) -> CypherGenerationResponse:
+    def _generate_cypher_with_groq(
+        self,
+        question: str,
+        week_number: int,
+    ) -> CypherGenerationResponse:
         if not settings.groq_api_key:
-            return self._fallback_cypher(question)
+            return self._fallback_cypher(question, week_number)
 
         client = Groq(api_key=settings.groq_api_key)
         completion = client.chat.completions.create(
@@ -224,9 +250,13 @@ class RetrievalService:
         content = completion.choices[0].message.content or "{}"
         return CypherGenerationResponse.model_validate_json(content)
 
-    def _generate_cypher_with_gemini(self, question: str) -> CypherGenerationResponse:
+    def _generate_cypher_with_gemini(
+        self,
+        question: str,
+        week_number: int,
+    ) -> CypherGenerationResponse:
         if not settings.gemini_api_key:
-            return self._fallback_cypher(question)
+            return self._fallback_cypher(question, week_number)
 
         import google.generativeai as genai
 
@@ -247,9 +277,10 @@ class RetrievalService:
         return (
             "Generate a single read-only Neo4j Cypher query for an academic concept graph. "
             "The graph uses (:Course {id}) nodes connected to "
-            "(:Concept {id, name, type, description}) nodes by [:CONTAINS]. "
+            "(:Concept {id, name, type, description, week}) nodes by [:CONTAINS]. "
             "Always scope the query to MATCH (course:Course {id: $course_id}) and only "
-            "return concepts contained by that course. "
+            "return concepts contained by that course and the requested week_number. "
+            "Always include `week_number` in any concept or prerequisite filters. "
             "The query must return a variable named concept and a variable named prerequisites. "
             "prerequisites must contain prerequisite Concept nodes up to 2 hops away. "
             "Use parameters instead of interpolating user text. Do not write, merge, delete, "
@@ -258,7 +289,7 @@ class RetrievalService:
         )
 
     @staticmethod
-    def _fallback_cypher(question: str) -> CypherGenerationResponse:
+    def _fallback_cypher(question: str, week_number: int) -> CypherGenerationResponse:
         terms = [
             term.lower()
             for term in re.findall(r"[A-Za-z][A-Za-z0-9_+-]{2,}", question)
@@ -267,9 +298,10 @@ class RetrievalService:
         return CypherGenerationResponse(
             cypher="""
             MATCH (course:Course {id: $course_id})-[:CONTAINS]->(concept:Concept)
-            WHERE any(term IN $terms WHERE toLower(concept.name) CONTAINS term)
+            WHERE concept.week = $week_number
+              AND any(term IN $terms WHERE toLower(concept.name) CONTAINS term)
             OPTIONAL MATCH (prerequisite:Concept)-[*1..2]->(concept)
-            WHERE prerequisite IS NULL OR (course)-[:CONTAINS]->(prerequisite)
+            WHERE prerequisite IS NULL OR ((course)-[:CONTAINS]->(prerequisite) AND prerequisite.week = $week_number)
             RETURN concept, collect(DISTINCT prerequisite) AS prerequisites
             LIMIT 5
             """,
@@ -306,17 +338,20 @@ class RetrievalService:
         self,
         session,
         course_id: str,
+        week_number: int,
     ) -> list[dict[str, Any]]:
         result = await session.run(
             """
             MATCH (course:Course {id: $course_id})-[:CONTAINS]->(concept:Concept)
+            WHERE concept.week = $week_number
             OPTIONAL MATCH (prerequisite:Concept)-[*1..2]->(concept)
-            WHERE prerequisite IS NULL OR (course)-[:CONTAINS]->(prerequisite)
+            WHERE prerequisite IS NULL OR ((course)-[:CONTAINS]->(prerequisite) AND prerequisite.week = $week_number)
             RETURN concept, collect(DISTINCT prerequisite) AS prerequisites
             ORDER BY concept.name
             LIMIT 50
             """,
             course_id=course_id,
+            week_number=week_number,
         )
         return await result.data()
 

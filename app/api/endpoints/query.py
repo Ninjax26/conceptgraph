@@ -19,6 +19,7 @@ class QueryRequest(BaseModel):
 
     question: str = Field(..., min_length=1)
     course_id: str = Field(..., min_length=1)
+    week_number: int = Field(..., ge=1)
 
 
 class QueryResponse(BaseModel):
@@ -59,6 +60,7 @@ async def query_conceptgraph(
     retrieval_result = await retrieval_service.retrieve(
         question=request.question,
         course_id=request.course_id,
+        week_number=request.week_number,
     )
     if not retrieval_result["chunks"]:
         raise HTTPException(

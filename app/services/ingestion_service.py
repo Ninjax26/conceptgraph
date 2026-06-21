@@ -102,6 +102,7 @@ class IngestionService:
         self,
         extraction: GraphExtractionResponse,
         course_id: str,
+        week_number: int,
     ) -> None:
         async with self.graph_driver.session() as session:
             await session.run(
@@ -120,7 +121,8 @@ class IngestionService:
                         c.type = $type,
                         c.description = $description,
                         c.source_id = $source_id,
-                        c.course_id = $course_id
+                        c.course_id = $course_id,
+                        c.week = $week_number
                     WITH c
                     MATCH (course:Course {id: $course_id})
                     MERGE (course)-[:CONTAINS]->(c)
@@ -131,6 +133,7 @@ class IngestionService:
                     type=node.type,
                     description=node.description,
                     course_id=course_id,
+                    week_number=week_number,
                 )
 
             for relationship in extraction.relationships:
@@ -144,7 +147,8 @@ class IngestionService:
                     MATCH (course)-[:CONTAINS]->(target)
                     MERGE (source)-[r:{relation_type} {{course_id: $course_id}}]->(target)
                     SET r.relation_type = $relation_type,
-                        r.course_id = $course_id
+                        r.course_id = $course_id,
+                        r.week = $week_number
                     """,
                     course_id=course_id,
                     source_node_id=self._scoped_concept_id(
@@ -156,14 +160,20 @@ class IngestionService:
                         relationship.target_node_id,
                     ),
                     relation_type=relationship.relation_type,
+                    week_number=week_number,
                 )
 
     async def ingest_chunks(self, chunks: Sequence[DocumentChunk]) -> dict[str, int]:
         self._validate_llm_configured()
         course_id = self._course_id_from_chunks(chunks)
+        week_number = self._week_number_from_chunks(chunks)
         vector_count = self.upsert_chunks_to_qdrant(chunks)
         graph_extraction = await self.extract_graph_from_chunks(chunks)
-        await self.store_graph_extraction(graph_extraction, course_id=course_id)
+        await self.store_graph_extraction(
+            graph_extraction,
+            course_id=course_id,
+            week_number=week_number,
+        )
         return {
             "chunks_indexed": vector_count,
             "nodes_upserted": len(graph_extraction.nodes),
@@ -272,6 +282,16 @@ class IngestionService:
         if not isinstance(course_id, str) or not course_id.strip():
             raise ValueError("Chunk metadata must include a non-empty document_id.")
         return course_id
+
+    @staticmethod
+    def _week_number_from_chunks(chunks: Sequence[DocumentChunk]) -> int:
+        if not chunks:
+            raise ValueError("Cannot ingest an empty chunk list.")
+
+        week_number = chunks[0].metadata.get("week")
+        if not isinstance(week_number, int) or week_number < 1:
+            raise ValueError("Chunk metadata must include a valid week number.")
+        return week_number
 
     @staticmethod
     def _scoped_concept_id(course_id: str, concept_id: str) -> str:

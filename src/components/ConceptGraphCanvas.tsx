@@ -126,8 +126,8 @@ export default function ConceptGraphCanvas({
       cy.elements().removeClass("selectedPath dimmed");
       cy.elements().addClass("dimmed");
 
-      // Animated traversal: follow the first outgoing link repeatedly
-      // This makes linear prerequisite chains feel alive.
+      // Animated traversal: follow prerequisite links back through the chain.
+      // This makes the selected concept reveal what it depends on.
       try {
         const maxSteps = 50;
         let current: NodeSingular | null = selected;
@@ -136,12 +136,15 @@ export default function ConceptGraphCanvas({
         current.removeClass("dimmed").addClass("selectedPath");
 
         for (let step = 0; step < maxSteps && current; step++) {
-          const outEdges = current.outgoers("edge");
-          if (outEdges.length === 0) break;
+          const inEdges = current.incomers("edge");
+          if (inEdges.length === 0) break;
 
-          // Prefer an edge that leads to an unvisited node
-          let edge = (outEdges.filter((e) => !( (e as EdgeSingular).target().hasClass("selectedPath") ))[0] ?? outEdges[0]) as EdgeSingular;
-          const targetNode = edge.target() as NodeSingular;
+          // Prefer an edge that leads to an unvisited prerequisite node
+          const edge = (
+            inEdges.filter((e) => !((e as EdgeSingular).source().hasClass("selectedPath")))[0] ??
+            inEdges[0]
+          ) as EdgeSingular;
+          const targetNode = edge.source() as NodeSingular;
 
           // reveal and animate the edge
           edge.removeClass("dimmed");
@@ -171,11 +174,11 @@ export default function ConceptGraphCanvas({
         }
       } catch (err) {
         // Fallback: instant highlight if animation fails
-        const outgoingEdges = selected.outgoers("edge");
-        const outgoingNodes = selected.outgoers("node");
+        const incomingEdges = selected.incomers("edge");
+        const incomingNodes = selected.incomers("node");
         selected.removeClass("dimmed").addClass("selectedPath");
-        outgoingEdges.removeClass("dimmed").addClass("selectedPath");
-        outgoingNodes.removeClass("dimmed").addClass("selectedPath");
+        incomingEdges.removeClass("dimmed").addClass("selectedPath");
+        incomingNodes.removeClass("dimmed").addClass("selectedPath");
       }
     });
 
