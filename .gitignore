@@ -16,6 +16,8 @@ data/
 
 *.log
 
+*.pdf
+
 node_modules/
 dist/
 .vite/

@@ -12,7 +12,7 @@ ConceptGraph is an AI-powered academic knowledge graph and GraphRAG pipeline for
 - Stores semantic chunks in Qdrant for vector search.
 - Extracts concepts and prerequisite relationships into Neo4j.
 - Uses hybrid retrieval to combine graph traversal, vector search, reranking, and LLM synthesis.
-- Generates syllabus-bounded mock exams using week-level metadata.
+- Generates course-wide mock exams directly from uploaded material.
 - Tracks PDF ingestion status in real time through Celery-backed upload records.
 - Opens source citations with page-aware PDF previews in the dashboard.
 - Renders an interactive concept map in the React dashboard.
@@ -50,7 +50,7 @@ flowchart TD
 - Multi-tenant course scoping to prevent syllabus bleed across uploads.
 - Hybrid GraphRAG retrieval that expands user queries with prerequisite concepts.
 - Defensive error handling with explicit HTTP responses for missing config or empty data.
-- Week-level metadata tagging for syllabus-bounded exam generation.
+- Simple course-level isolation across ingestion, retrieval, and exam generation.
 - Apple Silicon-friendly local execution with `arm64` container images and MPS-accelerated embeddings where available.
 
 ## Tech Stack
@@ -161,6 +161,39 @@ Open the app at `http://127.0.0.1:5173`.
 6. The LLM extracts concepts and prerequisite relationships.
 7. Neo4j stores the scoped concept graph for the course.
 
+### Data Consistency
+
+- Courses have an immutable UUID plus a normalized, case-insensitive display name. `CYBER`, `Cyber`, and `cyber ` resolve to the same course.
+- PDFs are SHA-256 hashed before a document row is created. Uploading the same file to the same course returns the existing document instead of duplicating vectors or graph nodes.
+- Query and exam generation call the same READY-course resolver and filter Qdrant by READY document IDs.
+- Graph nodes and relationships carry document provenance (`upload_id` and document name). Legacy graph data without provenance is excluded from query graph counts.
+- Failed attempts are retained in `processing_attempts`; retries update the original document and are capped at three attempts.
+
+| Stage | Input | Output / storage | Success condition | Failure condition |
+| --- | --- | --- | --- | --- |
+| Upload | PDF + course name | `courses`, `document_uploads`, stored PDF | Valid PDF, canonical course, unique course/hash document | Invalid, encrypted, oversized, or malformed PDF |
+| Extract | Stored PDF | Page text in worker memory | At least one readable page | Empty/scanned PDF or missing source |
+| Chunk | Page text | Typed chunks with document/page/section metadata | At least one non-empty chunk | No valid chunks |
+| Embed | Chunks | Qdrant points filtered by READY document ID | Every chunk upsert completes | Vector service/model failure |
+| Build graph | Representative text | Neo4j concepts/relationships with document provenance | Graph transaction completes | Provider or graph database failure |
+| Commit READY | Stored counts | `document_uploads` + `processing_attempts` | All mandatory writes committed | Compensating cleanup and `FAILED` |
+| Query | Course name/UUID + question | Ranked sources, answer, query subgraph | Shared READY context and usable vectors | `404` unknown course, `409` no usable READY data |
+| Exam | Course name/UUID + question count | Validated questions + source count | Same READY context and usable vectors | Same `404`/`409` readiness rules as query |
+| Dashboard | Upload/status/query responses | Grouped queue, citations, graph metadata | Stable typed API contract | Safe actionable error state |
+
+### Processing States
+
+Documents progress through durable stages:
+
+```text
+UPLOADED -> EXTRACTING -> EXTRACTED -> CHUNKING -> CHUNKED
+-> BUILDING_GRAPH -> GRAPH_BUILT -> EMBEDDING -> EMBEDDED -> READY
+```
+
+Terminal states are `READY`, `FAILED`, and `CANCELLED`. A document becomes `READY` only after text extraction, chunk creation, graph construction, vector storage, and database count updates succeed. A failed attempt compensates by deleting partial vectors and provenance-scoped graph nodes.
+
+Failure categories are `DOCUMENT_ERROR`, `CONFIGURATION_ERROR`, `PROVIDER_ERROR`, `WORKER_ERROR`, `TIMEOUT_ERROR`, `DATABASE_ERROR`, and `UNKNOWN_ERROR`. Permanent document/configuration failures cannot be retried in the dashboard. Temporary provider, worker, timeout, and database failures may be retried until the attempt limit is reached.
+
 ### Retrieval
 
 1. The user asks a question.
@@ -170,10 +203,12 @@ Open the app at `http://127.0.0.1:5173`.
 5. A local cross-encoder reranks the chunks.
 6. The synthesis model answers strictly from the provided context.
 
+Answers use readable citations such as `[Source 1]` and `[Source 2, p. 6]`. Internal chunk IDs, vector IDs, file paths, and scores are never included in model prompts or displayed answers. Source cards include the PDF name, page, detected section heading, and supporting passage.
+
 ### Exam Generation
 
-1. The user selects a course and week number.
-2. Qdrant is filtered by `course_id` and `week`.
+1. The user selects a course.
+2. Qdrant is filtered by `course_id`.
 3. The LLM generates a syllabus-bounded mock exam.
 
 ## API Endpoints
@@ -181,11 +216,55 @@ Open the app at `http://127.0.0.1:5173`.
 - `POST /api/v1/ingest/upload`
 - `GET /api/v1/ingest/status/{task_id}`
 - `GET /api/v1/ingest/uploads/{upload_id}/preview`
+- `POST /api/v1/ingest/uploads/{upload_id}/retry`
+- `DELETE /api/v1/ingest/uploads/{upload_id}` (failed records only)
 - `POST /api/v1/query`
 - `POST /api/v1/exam/generate`
+- `GET /api/v1/health`
+
+Query and exam responses use the same course readiness rules:
+
+- `404`: the course does not exist.
+- `409`: the course exists but has no READY documents, or READY metadata points to missing vectors.
+- `200`: at least one READY document has usable indexed content.
+
+The query response also includes graph count metadata:
+
+```json
+{
+  "total_nodes": 18,
+  "total_edges": 14,
+  "displayed_nodes": 4,
+  "displayed_edges": 2,
+  "filter_reason": "query_subgraph"
+}
+```
+
+These values are illustrative response fields, not hardcoded dashboard statistics; the API calculates them from the selected READY documents.
+
+## Database Migration
+
+Startup performs an idempotent migration for existing local installations:
+
+- Creates `courses` and `processing_attempts`.
+- Adds canonical course UUID, SHA-256 hash, stage, failure, retry, attempt, and output-count columns to `document_uploads`.
+- Maps legacy `completed` rows with stored chunks to `READY`.
+- Converts interrupted legacy `queued`/`running` rows to retryable `WORKER_ERROR` failures.
+- Computes hashes for legacy PDFs that are still present on disk.
+
+The migration is additive and does not delete existing PDFs. Old Neo4j nodes without document provenance are intentionally excluded from new graph totals and should be rebuilt through explicit document reprocessing rather than silently attributed to a document.
+
+## Tests
+
+Run backend rules and frontend production checks with:
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+npm run build
+```
 
 ## Notes
 
 - The Neo4j graph is course-scoped to avoid mixing unrelated syllabi.
-- `week_number` is required for syllabus-bounded exam generation.
+- A course can contain multiple PDFs; retrieval and exams use all processed PDFs in that course.
 - The project is optimized for local development on Apple Silicon.

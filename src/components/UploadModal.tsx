@@ -8,23 +8,28 @@ interface UploadModalProps {
   onUploaded?: (upload: IngestResponse) => void;
 }
 
+const MAX_FILE_BYTES = 10 * 1024 * 1024;
+
 export default function UploadModal({
   isOpen,
   onClose,
   onUploaded,
 }: UploadModalProps): JSX.Element | null {
   const [courseId, setCourseId] = useState("");
-  const [weekNumber, setWeekNumber] = useState(1);
   const [file, setFile] = useState<File | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [message, setMessage] = useState<{ text: string; type: "success" | "error" } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const canSubmitUpload = file !== null && courseId.trim().length > 0;
 
   if (!isOpen) return null;
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selected = e.target.files?.[0];
-    if (selected && selected.type === "application/pdf") {
+    if (selected && selected.size > MAX_FILE_BYTES) {
+      setMessage({ text: "PDF files must be 10 MB or smaller.", type: "error" });
+      setFile(null);
+    } else if (selected && selected.type === "application/pdf") {
       setFile(selected);
       setMessage(null);
     } else if (selected) {
@@ -36,7 +41,10 @@ export default function UploadModal({
   const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     const dropped = e.dataTransfer.files?.[0];
-    if (dropped && dropped.type === "application/pdf") {
+    if (dropped && dropped.size > MAX_FILE_BYTES) {
+      setMessage({ text: "PDF files must be 10 MB or smaller.", type: "error" });
+      setFile(null);
+    } else if (dropped && dropped.type === "application/pdf") {
       setFile(dropped);
       setMessage(null);
     } else if (dropped) {
@@ -46,20 +54,19 @@ export default function UploadModal({
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
-    if (!file || !courseId.trim() || weekNumber < 1) return;
+    if (!canSubmitUpload || file === null) return;
 
     setIsUploading(true);
     setMessage(null);
 
     try {
-      const res = await uploadDocument(file, courseId.trim(), weekNumber);
+      const res = await uploadDocument(file, courseId.trim());
       onUploaded?.(res);
       setMessage({ text: res.message || "Background processing has started.", type: "success" });
       setTimeout(() => {
         onClose();
         setFile(null);
         setCourseId("");
-        setWeekNumber(1);
         setMessage(null);
       }, 2000);
     } catch (err) {
@@ -95,20 +102,6 @@ export default function UploadModal({
               value={courseId}
               onChange={(e) => setCourseId(e.target.value)}
               placeholder="e.g., machine-learning-101"
-              className="mt-1 block w-full rounded-md border border-slate-300 px-3 py-2 shadow-sm focus:border-teal-500 focus:outline-none focus:ring-1 focus:ring-teal-500 dark:border-slate-600 dark:bg-slate-700 dark:text-white"
-              required
-            />
-          </div>
-
-          <div>
-            <label className="block text-sm font-medium text-slate-700 dark:text-slate-300">
-              Week Number
-            </label>
-            <input
-              type="number"
-              min={1}
-              value={weekNumber}
-              onChange={(e) => setWeekNumber(Number(e.target.value))}
               className="mt-1 block w-full rounded-md border border-slate-300 px-3 py-2 shadow-sm focus:border-teal-500 focus:outline-none focus:ring-1 focus:ring-teal-500 dark:border-slate-600 dark:bg-slate-700 dark:text-white"
               required
             />
@@ -161,7 +154,7 @@ export default function UploadModal({
           <div className="mt-5 sm:mt-6 sm:grid sm:grid-flow-row-dense sm:grid-cols-2 sm:gap-3">
             <button
               type="submit"
-              disabled={!file || !courseId.trim() || weekNumber < 1 || isUploading}
+              disabled={!canSubmitUpload || isUploading}
               className="inline-flex w-full justify-center rounded-md border border-transparent bg-teal-600 px-4 py-2 text-base font-medium text-white shadow-sm hover:bg-teal-700 focus:outline-none focus:ring-2 focus:ring-teal-500 focus:ring-offset-2 disabled:cursor-not-allowed disabled:bg-slate-400 sm:col-start-2 sm:text-sm"
             >
               {isUploading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}

@@ -1,5 +1,8 @@
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
+import hashlib
+from pathlib import Path
+import uuid
 
 from neo4j import AsyncDriver, AsyncGraphDatabase
 from qdrant_client import QdrantClient
@@ -9,6 +12,8 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy.pool import NullPool
+from sqlalchemy import text
 
 from app.core.config import settings
 from app.models.document_upload import Base
@@ -23,7 +28,10 @@ class DatabaseClients:
 
 postgres_engine: AsyncEngine = create_async_engine(
     settings.postgres_dsn,
-    pool_pre_ping=True,
+    # Celery's solo worker creates a fresh asyncio loop per task. Reusing an
+    # asyncpg connection across those loops causes "Future attached to a
+    # different loop" failures on the second upload.
+    poolclass=NullPool,
 )
 
 AsyncSessionLocal: async_sessionmaker[AsyncSession] = async_sessionmaker(
@@ -56,7 +64,73 @@ async def get_db() -> AsyncGenerator[DatabaseClients, None]:
 
 async def initialize_database_schema() -> None:
     async with postgres_engine.begin() as conn:
+        await conn.run_sync(lambda sync_conn: Base.metadata.tables["courses"].create(sync_conn, checkfirst=True))
+        migrations = [
+            "ALTER TABLE document_uploads ADD COLUMN IF NOT EXISTS course_uuid VARCHAR(64)",
+            "ALTER TABLE document_uploads ADD COLUMN IF NOT EXISTS content_hash VARCHAR(64)",
+            "ALTER TABLE document_uploads ADD COLUMN IF NOT EXISTS stage VARCHAR(32) NOT NULL DEFAULT 'UPLOADED'",
+            "ALTER TABLE document_uploads ADD COLUMN IF NOT EXISTS failure_category VARCHAR(32)",
+            "ALTER TABLE document_uploads ADD COLUMN IF NOT EXISTS retryable BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE document_uploads ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE document_uploads ADD COLUMN IF NOT EXISTS last_attempted_at TIMESTAMPTZ",
+            "ALTER TABLE document_uploads ADD COLUMN IF NOT EXISTS processed_chunk_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE document_uploads ADD COLUMN IF NOT EXISTS graph_node_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE document_uploads ADD COLUMN IF NOT EXISTS graph_edge_count INTEGER NOT NULL DEFAULT 0",
+            "CREATE INDEX IF NOT EXISTS ix_document_uploads_course_uuid ON document_uploads (course_uuid)",
+            "CREATE INDEX IF NOT EXISTS ix_document_uploads_content_hash ON document_uploads (content_hash)",
+            "CREATE INDEX IF NOT EXISTS ix_document_uploads_stage ON document_uploads (stage)",
+        ]
+        for statement in migrations:
+            await conn.execute(text(statement))
         await conn.run_sync(Base.metadata.create_all)
+        await _migrate_legacy_uploads(conn)
+
+
+async def _migrate_legacy_uploads(conn) -> None:
+    rows = (
+        await conn.execute(
+            text("SELECT upload_id, course_id, stored_file_path, status, result_json, created_at FROM document_uploads WHERE course_uuid IS NULL")
+        )
+    ).mappings().all()
+    for row in rows:
+        normalized = " ".join(row["course_id"].strip().casefold().split())
+        course_uuid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"conceptgraph:course:{normalized}"))
+        await conn.execute(
+            text(
+                "INSERT INTO courses (id, normalized_name, display_name) VALUES (:id, :normalized, :display) "
+                "ON CONFLICT (normalized_name) DO NOTHING"
+            ),
+            {"id": course_uuid, "normalized": normalized, "display": row["course_id"].strip().upper()},
+        )
+        file_path = Path(row["stored_file_path"])
+        content_hash = None
+        if file_path.exists():
+            digest = hashlib.sha256()
+            with file_path.open("rb") as source:
+                for block in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(block)
+            content_hash = digest.hexdigest()
+        result = row["result_json"] or {}
+        chunks = int(result.get("chunks_indexed", 0))
+        nodes = int(result.get("nodes_upserted", 0))
+        edges = int(result.get("relationships_upserted", 0))
+        if row["status"] == "completed" and chunks > 0:
+            stage, status, retryable, category = "READY", "ready", False, None
+        elif row["status"] in {"queued", "running"}:
+            stage, status, retryable, category = "FAILED", "failed", True, "WORKER_ERROR"
+        else:
+            stage, status, retryable, category = "FAILED", "failed", False, "UNKNOWN_ERROR"
+        await conn.execute(
+            text(
+                "UPDATE document_uploads SET course_uuid=:course_uuid, content_hash=COALESCE(content_hash,:hash), "
+                "stage=:stage, status=:status, retryable=:retryable, failure_category=COALESCE(failure_category,:category), "
+                "processed_chunk_count=:chunks, graph_node_count=:nodes, graph_edge_count=:edges, "
+                "last_attempted_at=COALESCE(last_attempted_at, updated_at) WHERE upload_id=:upload_id"
+            ),
+            {"course_uuid": course_uuid, "hash": content_hash, "stage": stage, "status": status,
+             "retryable": retryable, "category": category, "chunks": chunks, "nodes": nodes,
+             "edges": edges, "upload_id": row["upload_id"]},
+        )
 
 
 async def close_database_connections() -> None:

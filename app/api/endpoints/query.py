@@ -1,17 +1,23 @@
 import asyncio
+import logging
 from functools import lru_cache
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.core.exceptions import LLMConfigurationError
 from app.services.rag_service import RetrievalService
 from app.services.rerank_service import RerankService
 from app.services.synthesis_service import SynthesisService
+from app.services.citation_service import build_sources
+from app.services.course_service import CourseNotFoundError, CourseNotReadyError, CourseService
+from app.core.database import get_postgres_session
 
 
 router = APIRouter(prefix="/api/v1", tags=["query"])
+logger = logging.getLogger(__name__)
 
 
 class QueryRequest(BaseModel):
@@ -19,13 +25,13 @@ class QueryRequest(BaseModel):
 
     question: str = Field(..., min_length=1)
     course_id: str = Field(..., min_length=1)
-    week_number: int = Field(..., ge=1)
 
 
 class QueryResponse(BaseModel):
     answer: str
     sources: list[dict[str, Any]]
     graph_context: list[dict[str, Any]]
+    graph_metadata: dict[str, Any]
 
 
 @lru_cache
@@ -47,6 +53,7 @@ def get_synthesis_service() -> SynthesisService:
 async def query_conceptgraph(
     request: QueryRequest,
     retrieval_service: RetrievalService = Depends(get_retrieval_service),
+    db: AsyncSession = Depends(get_postgres_session),
 ) -> QueryResponse:
     synthesis_service = get_synthesis_service()
     try:
@@ -57,40 +64,73 @@ async def query_conceptgraph(
             detail=f"LLM provider is not configured: {exc}",
         ) from exc
 
-    retrieval_result = await retrieval_service.retrieve(
-        question=request.question,
-        course_id=request.course_id,
-        week_number=request.week_number,
-    )
+    try:
+        course_context = await CourseService().get_ready_context(db, request.course_id)
+    except CourseNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except CourseNotReadyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    try:
+        retrieval_result = await retrieval_service.retrieve(
+            question=request.question,
+            context=course_context,
+        )
+    except Exception as exc:
+        logger.exception("Retrieval pipeline failed")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Course retrieval is temporarily unavailable. Please try again.",
+        ) from exc
     if not retrieval_result["chunks"]:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
+            status_code=status.HTTP_409_CONFLICT,
             detail=(
-                "No syllabus data found for this course. Please upload and process "
-                "a document before querying ConceptGraph."
+                "Ready document records exist, but their indexed chunks are unavailable. "
+                "Reprocess the affected document."
             ),
         )
 
     rerank_service = get_rerank_service()
-    ranked_chunks = await asyncio.to_thread(
-        rerank_service.rerank,
-        request.question,
-        retrieval_result["chunks"],
-    )
+    try:
+        ranked_chunks = await asyncio.to_thread(
+            rerank_service.rerank,
+            request.question,
+            retrieval_result["chunks"],
+        )
+    except Exception as exc:
+        logger.exception("Reranking pipeline failed")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Result ranking is temporarily unavailable. Please try again.",
+        ) from exc
+    sources = build_sources(ranked_chunks)
+    if not sources:
+        raise HTTPException(
+            status_code=404,
+            detail="No reliable source passages were found for this question.",
+        )
     try:
         answer = await synthesis_service.synthesize(
             question=request.question,
             graph_context=retrieval_result["graph_context"],
-            ranked_chunks=ranked_chunks,
+            sources=sources,
         )
     except LLMConfigurationError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"LLM provider is not configured: {exc}",
         ) from exc
+    except Exception as exc:
+        logger.exception("Answer synthesis failed")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Answer generation is temporarily unavailable. Please try again.",
+        ) from exc
 
     return QueryResponse(
         answer=answer,
-        sources=ranked_chunks[:4],
+        sources=sources,
         graph_context=retrieval_result["graph_context"],
+        graph_metadata=retrieval_result["graph_metadata"],
     )

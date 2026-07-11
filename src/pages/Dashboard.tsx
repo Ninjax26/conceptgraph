@@ -1,8 +1,19 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, lazy, Suspense, useEffect, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
-import { ExternalLink, Loader2, Send, UploadCloud } from "lucide-react";
+import {
+  Check,
+  ChevronDown,
+  Copy,
+  ExternalLink,
+  Loader2,
+  RefreshCw,
+  RotateCcw,
+  Send,
+  Trash2,
+  UploadCloud,
+} from "lucide-react";
 
-import ConceptGraphCanvas, {
+import type {
   GraphCanvasEdge,
   GraphCanvasNode,
 } from "../components/ConceptGraphCanvas";
@@ -15,20 +26,37 @@ import {
   QueryResponse,
   UploadStatusResponse,
   getUploadStatus,
+  listUploads,
+  retryUpload,
+  removeFailedUpload,
   sendQuery,
 } from "../services/api";
 
 const DEFAULT_COURSE_ID = "default-course";
+const ConceptGraphCanvas = lazy(() => import("../components/ConceptGraphCanvas"));
+const ExamPanel = lazy(() => import("../components/ExamPanel"));
+const QUESTION_STARTERS = [
+  "Summarize the most important concepts in this course.",
+  "What should I learn first, and why?",
+  "Explain the hardest concept with a simple example.",
+];
+
+type UploadJob = UploadStatusResponse & {
+  status_poll_error?: string | null;
+};
 
 export default function Dashboard(): JSX.Element {
   const [question, setQuestion] = useState("");
   const [courseId, setCourseId] = useState(DEFAULT_COURSE_ID);
-  const [weekNumber, setWeekNumber] = useState(1);
   const [response, setResponse] = useState<QueryResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [isUploadModalOpen, setIsUploadModalOpen] = useState(false);
-  const [uploadJobs, setUploadJobs] = useState<UploadStatusResponse[]>([]);
+  const [uploadJobs, setUploadJobs] = useState<UploadJob[]>([]);
+  const [showAllUploads, setShowAllUploads] = useState(false);
+  const [retryingUploadId, setRetryingUploadId] = useState<string | null>(null);
+  const [answerCopied, setAnswerCopied] = useState(false);
+  const [queueFilter, setQueueFilter] = useState<"active" | "ready" | "failed" | "all">("all");
   const [selectedPreview, setSelectedPreview] = useState<{
     title: string;
     previewUrl: string;
@@ -38,10 +66,42 @@ export default function Dashboard(): JSX.Element {
     () => buildGraphElements(response?.graph_context ?? []),
     [response],
   );
+  const canSubmitQuery = question.trim().length > 0 && courseId.trim().length > 0;
+  const filteredUploads = uploadJobs
+    .filter((job) => queueFilter === "all" || job.status === queueFilter)
+    .sort((left, right) => {
+      const rank = { active: 0, ready: 1, failed: 2, cancelled: 3 };
+      return rank[left.status] - rank[right.status] || Date.parse(right.updated_at) - Date.parse(left.updated_at);
+    });
+  const visibleUploads = showAllUploads ? filteredUploads : filteredUploads.slice(0, 4);
+  const courseIds = Array.from(new Set(uploadJobs.map((job) => job.course_name)));
+
+  async function refreshUploads(): Promise<void> {
+    try {
+      setUploadJobs(await listUploads());
+    } catch (requestError) {
+      setError(
+        requestError instanceof Error
+          ? requestError.message
+          : "Unable to load recent uploads.",
+      );
+    }
+  }
+
+  useEffect(() => {
+    void refreshUploads();
+  }, []);
+
+  useEffect(() => {
+    if (courseId === DEFAULT_COURSE_ID) {
+      const readyCourse = uploadJobs.find((job) => job.status === "ready")?.course_name;
+      if (readyCourse) setCourseId(readyCourse);
+    }
+  }, [courseId, uploadJobs]);
 
   useEffect(() => {
     const pending = uploadJobs.filter(
-      (job) => job.status === "queued" || job.status === "running",
+      (job) => job.status === "active",
     );
     if (pending.length === 0) {
       return undefined;
@@ -54,13 +114,32 @@ export default function Dashboard(): JSX.Element {
 
       setUploadJobs((current) =>
         current.map((job) => {
-          const match = results.find(
-            (result) => result.status === "fulfilled" && result.value.task_id === job.task_id,
+          const pendingIndex = pending.findIndex(
+            (pendingJob) => pendingJob.task_id === job.task_id,
           );
-          if (!match || match.status !== "fulfilled") {
+          if (pendingIndex === -1) {
             return job;
           }
-          return match.value;
+
+          const result = results[pendingIndex];
+          if (!result) {
+            return job;
+          }
+
+          if (result.status === "fulfilled") {
+            return {
+              ...result.value,
+              status_poll_error: null,
+            };
+          }
+
+          return {
+            ...job,
+            status_poll_error:
+              result.reason instanceof Error
+                ? result.reason.message
+                : "Unable to refresh this upload status.",
+          };
         }),
       );
     }, 2500);
@@ -75,9 +154,17 @@ export default function Dashboard(): JSX.Element {
         upload_id: upload.upload_id,
         task_id: upload.task_id,
         course_id: upload.course_id,
-        week_number: upload.week_number,
+        course_name: upload.course_name,
         original_filename: upload.original_filename,
-        status: "queued",
+        status: upload.status === "READY" ? "ready" : "active",
+        stage: upload.status,
+        failure_category: null,
+        retryable: false,
+        attempt_count: 1,
+        last_attempted_at: now,
+        processed_chunk_count: 0,
+        graph_node_count: 0,
+        graph_edge_count: 0,
         error_message: null,
         result_json: null,
         created_at: now,
@@ -90,9 +177,39 @@ export default function Dashboard(): JSX.Element {
     ]);
   }
 
+  async function handleRetry(job: UploadJob): Promise<void> {
+    setRetryingUploadId(job.upload_id);
+    setError(null);
+    try {
+      const upload = await retryUpload(job.upload_id);
+      handleUploadCreated(upload);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Unable to retry upload.");
+    } finally {
+      setRetryingUploadId(null);
+    }
+  }
+
+  async function handleRemove(job: UploadJob): Promise<void> {
+    setError(null);
+    try {
+      await removeFailedUpload(job.upload_id);
+      setUploadJobs((current) => current.filter((item) => item.upload_id !== job.upload_id));
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Unable to remove record.");
+    }
+  }
+
+  async function copyAnswer(): Promise<void> {
+    if (!response?.answer) return;
+    await navigator.clipboard.writeText(response.answer);
+    setAnswerCopied(true);
+    window.setTimeout(() => setAnswerCopied(false), 1500);
+  }
+
   async function handleSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
-    if (!question.trim() || !courseId.trim() || weekNumber < 1) {
+    if (!canSubmitQuery) {
       return;
     }
 
@@ -100,7 +217,7 @@ export default function Dashboard(): JSX.Element {
     setError(null);
 
     try {
-      const result = await sendQuery(question.trim(), courseId.trim(), weekNumber);
+      const result = await sendQuery(question.trim(), courseId.trim());
       setResponse(result);
     } catch (requestError) {
       setError(
@@ -131,21 +248,14 @@ export default function Dashboard(): JSX.Element {
           <div className="space-y-3">
             <label className="block text-xs font-semibold uppercase tracking-wide text-slate-500">
               Course ID
-              <input
+              <select
                 className="mt-1 h-10 w-full rounded-md border border-slate-300 px-3 text-sm font-medium text-ink outline-none transition focus:border-signal focus:ring-2 focus:ring-teal-100"
                 value={courseId}
                 onChange={(event) => setCourseId(event.target.value)}
-              />
-            </label>
-            <label className="block text-xs font-semibold uppercase tracking-wide text-slate-500">
-              Week Number
-              <input
-                className="mt-1 h-10 w-full rounded-md border border-slate-300 px-3 text-sm font-medium text-ink outline-none transition focus:border-signal focus:ring-2 focus:ring-teal-100"
-                type="number"
-                min={1}
-                value={weekNumber}
-                onChange={(event) => setWeekNumber(Number(event.target.value))}
-              />
+              >
+                {!courseIds.includes(courseId) ? <option value={courseId}>{courseId}</option> : null}
+                {courseIds.map((id) => <option key={id} value={id} />)}
+              </select>
             </label>
             <label className="block text-xs font-semibold uppercase tracking-wide text-slate-500">
               Student Question
@@ -153,12 +263,25 @@ export default function Dashboard(): JSX.Element {
                 className="mt-1 min-h-28 w-full resize-none rounded-md border border-slate-300 px-3 py-2 text-sm leading-6 text-ink outline-none transition focus:border-signal focus:ring-2 focus:ring-teal-100"
                 value={question}
                 onChange={(event) => setQuestion(event.target.value)}
+                placeholder="Ask anything grounded in your uploaded PDFs..."
               />
             </label>
+            <div className="flex flex-wrap gap-2">
+              {QUESTION_STARTERS.map((starter) => (
+                <button
+                  className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1.5 text-left text-xs text-slate-600 transition hover:border-teal-300 hover:bg-teal-50 hover:text-teal-800"
+                  key={starter}
+                  onClick={() => setQuestion(starter)}
+                  type="button"
+                >
+                  {starter}
+                </button>
+              ))}
+            </div>
             <button
               className="inline-flex h-10 w-full items-center justify-center gap-2 rounded-md bg-ink px-4 text-sm font-semibold text-white transition hover:bg-slate-700 disabled:cursor-not-allowed disabled:bg-slate-400"
               type="submit"
-              disabled={isLoading || !question.trim() || !courseId.trim() || weekNumber < 1}
+              disabled={isLoading || !canSubmitQuery}
             >
               {isLoading ? (
                 <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
@@ -170,50 +293,112 @@ export default function Dashboard(): JSX.Element {
           </div>
         </form>
 
+        <Suspense fallback={<div className="border-b border-slate-200 p-4 text-xs text-slate-500">Loading practice tools...</div>}>
+          <ExamPanel courseId={courseId.trim()} />
+        </Suspense>
+
         <div className="border-b border-slate-200 p-4">
           <div className="mb-3 flex items-center justify-between">
             <h2 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
               Processing Queue
             </h2>
-            <span className="text-xs text-slate-400">{uploadJobs.length} uploads</span>
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-slate-400">{filteredUploads.length} documents</span>
+              <button
+                aria-label="Refresh uploads"
+                className="rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700"
+                onClick={() => void refreshUploads()}
+                type="button"
+              >
+                <RefreshCw className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          </div>
+          <div className="mb-3 flex gap-1 rounded-md bg-slate-100 p-1">
+            {(["active", "ready", "failed", "all"] as const).map((filter) => (
+              <button className={`flex-1 rounded px-2 py-1 text-[10px] font-semibold uppercase tracking-wide ${queueFilter === filter ? "bg-white text-ink shadow-sm" : "text-slate-500"}`} key={filter} onClick={() => setQueueFilter(filter)} type="button">
+                {filter}
+              </button>
+            ))}
           </div>
           {uploadJobs.length ? (
             <div className="space-y-2">
-              {uploadJobs.map((job) => (
+              {visibleUploads.map((job) => (
                 <div
-                  className="flex items-center justify-between gap-3 rounded-md border border-slate-200 bg-panel px-3 py-2"
+                  className="rounded-md border border-slate-200 bg-panel px-3 py-2"
                   key={job.task_id}
                 >
-                  <div className="min-w-0">
-                    <p className="truncate text-sm font-medium text-ink">
-                      {job.original_filename}
-                    </p>
-                    <p className="text-xs text-slate-500">
-                      Course {job.course_id} · Week {job.week_number}
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span className="rounded-full bg-slate-100 px-2.5 py-1 text-xs font-semibold uppercase tracking-wide text-slate-600">
-                      {job.status}
-                    </span>
-                    {job.status === "completed" ? (
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-medium text-ink">
+                        {job.original_filename}
+                      </p>
                       <button
-                        className="inline-flex items-center gap-1 rounded-md border border-slate-200 px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
-                        onClick={() =>
-                          setSelectedPreview({
-                            title: job.original_filename,
-                            previewUrl: `${API_BASE_URL}/ingest/uploads/${job.upload_id}/preview`,
-                          })
-                        }
+                        className="text-xs text-slate-500 hover:text-teal-700"
+                        onClick={() => setCourseId(job.course_name)}
                         type="button"
                       >
-                        <ExternalLink className="h-3.5 w-3.5" />
-                        Preview
+                        Course {job.course_name}
                       </button>
-                    ) : null}
+                    </div>
+                    <div className="flex shrink-0 items-center gap-2">
+                      <span className={statusClass(job.status)}>
+                        {job.status}
+                      </span>
+                      {job.status === "ready" ? (
+                        <button
+                          className="inline-flex items-center gap-1 rounded-md border border-slate-200 px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                          onClick={() =>
+                            setSelectedPreview({
+                              title: job.original_filename,
+                              previewUrl: `${API_BASE_URL}/ingest/uploads/${job.upload_id}/preview`,
+                            })
+                          }
+                          type="button"
+                        >
+                          <ExternalLink className="h-3.5 w-3.5" />
+                          Preview
+                        </button>
+                      ) : null}
+                      {job.status === "failed" && job.retryable ? (
+                        <button
+                          className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                          disabled={retryingUploadId === job.upload_id}
+                          onClick={() => void handleRetry(job)}
+                          type="button"
+                        >
+                          {retryingUploadId === job.upload_id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RotateCcw className="h-3.5 w-3.5" />}
+                          Retry
+                        </button>
+                      ) : null}
+                      {job.status === "failed" ? (
+                        <button aria-label={`Remove ${job.original_filename}`} className="grid h-7 w-7 place-items-center rounded-md border border-slate-200 bg-white text-slate-400 hover:bg-red-50 hover:text-red-600" onClick={() => void handleRemove(job)} type="button">
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      ) : null}
+                    </div>
                   </div>
+                  {job.error_message || job.status_poll_error ? (
+                    <p className="mt-2 text-xs text-red-600">
+                      {friendlyUploadError(job.error_message ?? job.status_poll_error)}
+                    </p>
+                  ) : null}
+                  <p className="mt-2 text-[10px] text-slate-400">
+                    {job.stage.split("_").join(" ")} · Attempt {job.attempt_count} · {formatRelativeTime(job.updated_at)}
+                    {job.failure_category ? ` · ${job.failure_category.split("_").join(" ")}` : ""}
+                  </p>
                 </div>
               ))}
+              {filteredUploads.length > 4 ? (
+                <button
+                  className="inline-flex w-full items-center justify-center gap-1 rounded-md py-2 text-xs font-semibold text-slate-500 hover:bg-slate-50 hover:text-slate-800"
+                  onClick={() => setShowAllUploads((value) => !value)}
+                  type="button"
+                >
+                  <ChevronDown className={`h-3.5 w-3.5 transition ${showAllUploads ? "rotate-180" : ""}`} />
+                  {showAllUploads ? "Show recent only" : `Show ${filteredUploads.length - 4} more`}
+                </button>
+              ) : null}
             </div>
           ) : (
             <p className="text-sm text-slate-500">
@@ -235,6 +420,14 @@ export default function Dashboard(): JSX.Element {
             </div>
           ) : null}
 
+          {response?.answer ? (
+            <div className="mb-2 flex justify-end">
+              <button className="inline-flex items-center gap-1.5 rounded-md border border-slate-200 px-2.5 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50" onClick={() => void copyAnswer()} type="button">
+                {answerCopied ? <Check className="h-3.5 w-3.5 text-teal-600" /> : <Copy className="h-3.5 w-3.5" />}
+                {answerCopied ? "Copied" : "Copy answer"}
+              </button>
+            </div>
+          ) : null}
           <article className="prose prose-slate max-w-none text-sm dark:prose-invert">
             {response?.answer ? (
               <ReactMarkdown>{response.answer}</ReactMarkdown>
@@ -251,28 +444,30 @@ export default function Dashboard(): JSX.Element {
                 Source Citations
               </h2>
               {response.sources.map((source, index) => (
-                <div
+                <details
                   className="rounded-md border border-slate-200 bg-panel p-3"
-                  key={source.id}
+                    key={source.source_id}
                 >
-                  <div className="mb-2 flex items-center justify-between gap-3 text-xs font-semibold text-slate-500">
-                    <span>Chunk {index + 1}</span>
-                    <span>{formatScore(source.rerank_score ?? source.score)}</span>
-                  </div>
+                  <summary className="cursor-pointer list-none text-xs font-semibold text-slate-600">
+                    <span className="flex items-center justify-between gap-3">
+                      <span>{source.document_name} · {formatPage(source.page_number)}{source.section_heading ? ` · ${source.section_heading}` : ""}</span>
+                      <span className="text-slate-400">View passage</span>
+                    </span>
+                  </summary>
                   <button
                     className="mb-2 inline-flex items-center gap-2 text-xs font-semibold text-teal-700 hover:text-teal-800"
                     onClick={() => {
                       const uploadId =
-                        typeof source.metadata.upload_id === "string"
-                          ? source.metadata.upload_id
+                        typeof source.document_id === "string"
+                          ? source.document_id
                           : "";
                       if (!uploadId) {
                         return;
                       }
 
                       const pageNumber =
-                        typeof source.metadata.page_number === "number"
-                          ? source.metadata.page_number
+                        typeof source.page_number === "number"
+                          ? source.page_number
                           : undefined;
                       const pageSuffix =
                         typeof pageNumber === "number" ? `#page=${pageNumber}` : "";
@@ -289,15 +484,15 @@ export default function Dashboard(): JSX.Element {
                     <ExternalLink className="h-3.5 w-3.5" />
                     Open PDF preview
                   </button>
-                  <p className="line-clamp-5 text-sm leading-6 text-slate-700">
-                    {source.text}
+                  <p className="mt-2 text-sm leading-6 text-slate-700">
+                    {source.supporting_passage}
                   </p>
                   <p className="mt-2 text-xs text-slate-500">
-                    {typeof source.metadata.page_number === "number"
-                      ? `Page ${source.metadata.page_number}`
+                    {typeof source.page_number === "number"
+                      ? `Page ${source.page_number}`
                       : "Page unavailable"}
                   </p>
-                </div>
+                </details>
               ))}
             </div>
           ) : null}
@@ -309,7 +504,9 @@ export default function Dashboard(): JSX.Element {
           <div>
             <h1 className="text-base font-semibold text-ink">Concept Map</h1>
             <p className="text-sm text-slate-500">
-              {graphElements.nodes.length} concepts, {graphElements.edges.length} links
+              {response?.graph_metadata
+                ? `Showing ${response.graph_metadata.displayed_nodes} of ${response.graph_metadata.total_nodes} concepts and ${response.graph_metadata.displayed_edges} of ${response.graph_metadata.total_edges} relationships.`
+                : `${graphElements.nodes.length} concepts, ${graphElements.edges.length} relationships`}
             </p>
           </div>
           <button
@@ -326,10 +523,18 @@ export default function Dashboard(): JSX.Element {
               <Loader2 className="h-8 w-8 animate-spin text-teal-500" />
             </div>
           )}
-          <ConceptGraphCanvas
-            nodes={graphElements.nodes}
-            edges={graphElements.edges}
-          />
+          {graphElements.nodes.length > 0 ? (
+            <Suspense fallback={<div className="grid h-full min-h-[480px] place-items-center rounded-md border border-slate-200 bg-panel text-sm text-slate-500">Loading concept map...</div>}>
+              <ConceptGraphCanvas
+                nodes={graphElements.nodes}
+                edges={graphElements.edges}
+              />
+            </Suspense>
+          ) : (
+            <div className="grid h-full min-h-[480px] place-items-center rounded-md border border-slate-200 bg-panel px-8 text-center text-sm text-slate-500">
+              Ask a question to load the conceptual prerequisite map.
+            </div>
+          )}
         </div>
       </section>
     </main>
@@ -362,12 +567,16 @@ function buildGraphElements(graphContext: GraphContextItem[]): {
         description: prerequisite.description,
       });
 
-      const edgeId = `${prerequisiteId}->${conceptId}`;
+    });
+
+    item.relationships.forEach((relationship, relationshipIndex) => {
+      if (!nodes.has(relationship.source) || !nodes.has(relationship.target)) return;
+      const edgeId = `${relationship.source}->${relationship.target}:${relationship.type}:${relationshipIndex}`;
       edges.set(edgeId, {
         id: edgeId,
-        source: prerequisiteId,
-        target: conceptId,
-        label: "PREREQUISITE_OF",
+        source: relationship.source,
+        target: relationship.target,
+        label: relationship.type,
       });
     });
   });
@@ -378,9 +587,41 @@ function buildGraphElements(graphContext: GraphContextItem[]): {
   };
 }
 
-function formatScore(score: number | undefined): string {
-  if (typeof score !== "number") {
-    return "score unavailable";
+function formatRelativeTime(value: string): string {
+  const elapsed = Date.now() - new Date(value).getTime();
+  const minutes = Math.max(0, Math.floor(elapsed / 60_000));
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+}
+
+function formatPage(page: unknown): string {
+  return typeof page === "number" ? `Page ${page}` : "PDF passage";
+}
+
+function statusClass(status: UploadStatusResponse["status"]): string {
+  const tone = {
+    active: "bg-blue-50 text-blue-700",
+    ready: "bg-teal-50 text-teal-700",
+    failed: "bg-red-50 text-red-700",
+    cancelled: "bg-slate-100 text-slate-600",
+  }[status];
+  return `rounded-full px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wide ${tone}`;
+}
+
+function friendlyUploadError(message: string | null | undefined): string {
+  if (!message) return "Document processing failed. Please retry.";
+  const normalized = message.toLowerCase();
+  if (normalized.includes("different loop") || normalized.includes("future pending")) {
+    return "The processing worker restarted unexpectedly. This issue is fixed; retry the document.";
   }
-  return score.toFixed(3);
+  if (normalized.includes("413") || normalized.includes("tokens per minute") || normalized.includes("rate_limit")) {
+    return "The AI service could not process this request at the time. Retry with the optimized pipeline.";
+  }
+  if (normalized.includes("api key") || normalized.includes("unauthorized")) {
+    return "The AI provider was not configured when this upload ran. Retry it now.";
+  }
+  return message.length > 180 ? "Document processing failed. Please retry it or upload another PDF." : message;
 }

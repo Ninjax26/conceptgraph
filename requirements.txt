@@ -6,6 +6,7 @@ neo4j
 qdrant-client
 sqlalchemy
 asyncpg
+greenlet
 pydantic
 pydantic-settings
 python-multipart

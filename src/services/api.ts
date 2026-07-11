@@ -12,22 +12,42 @@ export interface ConceptRelationship {
 }
 
 export interface SourceChunk {
-  id: string;
-  score?: number;
-  rerank_score?: number;
-  text: string;
+  source_id: string;
+  document_id: string;
+  document_name: string;
+  page_number: number | null;
+  section_heading: string | null;
+  supporting_passage: string;
+  source_type: "pdf";
   metadata: Record<string, string | number | boolean | null>;
+}
+
+export interface GraphRelationship {
+  source: string;
+  target: string;
+  type: string;
+  direction: string;
+  upload_id?: string;
+  document_name?: string;
 }
 
 export interface GraphContextItem {
   concept: Partial<ConceptNode>;
   prerequisites: Array<Partial<ConceptNode>>;
+  relationships: GraphRelationship[];
 }
 
 export interface QueryResponse {
   answer: string;
   sources: SourceChunk[];
   graph_context: GraphContextItem[];
+  graph_metadata: {
+    total_nodes: number;
+    total_edges: number;
+    displayed_nodes: number;
+    displayed_edges: number;
+    filter_reason: string;
+  };
 }
 
 export const API_BASE_URL =
@@ -43,12 +63,17 @@ async function fetchWithTimeout(url: string, options: RequestInit & { timeout?: 
     clearTimeout(id);
     if (!response.ok) {
       let message = response.statusText;
-      try {
-        const errJson = await response.json();
-        message = errJson.detail || message;
-      } catch (e) {
-        const errText = await response.text();
-        message = errText || message;
+      const errorBody = await response.text();
+      if (errorBody) {
+        try {
+          const errJson = JSON.parse(errorBody) as { detail?: unknown };
+          message =
+            typeof errJson.detail === "string"
+              ? errJson.detail
+              : JSON.stringify(errJson.detail ?? errJson);
+        } catch {
+          message = errorBody;
+        }
       }
       throw new Error(`API request failed: ${message}`);
     }
@@ -68,7 +93,6 @@ async function fetchWithTimeout(url: string, options: RequestInit & { timeout?: 
 export async function sendQuery(
   question: string,
   courseId: string,
-  weekNumber: number,
 ): Promise<QueryResponse> {
   const response = await fetchWithTimeout(`${API_BASE_URL}/query`, {
     method: "POST",
@@ -78,7 +102,6 @@ export async function sendQuery(
     body: JSON.stringify({
       question,
       course_id: courseId,
-      week_number: weekNumber,
     }),
     timeout: 60000, // 60s timeout for LLM synthesis
   });
@@ -95,13 +118,12 @@ export interface MockQuestion {
 
 export interface ExamResponse {
   course_id: string;
-  week_number: number;
   questions: MockQuestion[];
+  source_count: number;
 }
 
 export async function generateExam(
   courseId: string,
-  weekNumber: number,
   numQuestions: number = 5
 ): Promise<ExamResponse> {
   const response = await fetchWithTimeout(`${API_BASE_URL}/exam/generate`, {
@@ -111,7 +133,6 @@ export async function generateExam(
     },
     body: JSON.stringify({
       course_id: courseId,
-      week_number: weekNumber,
       num_questions: numQuestions,
     }),
     timeout: 60000, // 60s timeout for LLM exam generation
@@ -125,21 +146,20 @@ export interface IngestResponse {
   task_id: string;
   upload_id: string;
   course_id: string;
-  week_number: number;
+  course_name: string;
   original_filename: string;
-  status: "queued";
+  status: string;
+  duplicate: boolean;
   preview_url: string;
 }
 
 export async function uploadDocument(
   file: File,
   courseId: string,
-  weekNumber = 1,
 ): Promise<IngestResponse> {
   const formData = new FormData();
   formData.append("file", file);
   formData.append("course_id", courseId);
-  formData.append("week_number", String(weekNumber));
 
   const response = await fetchWithTimeout(`${API_BASE_URL}/ingest/upload`, {
     method: "POST",
@@ -154,9 +174,17 @@ export interface UploadStatusResponse {
   upload_id: string;
   task_id: string;
   course_id: string;
-  week_number: number;
+  course_name: string;
   original_filename: string;
-  status: "queued" | "running" | "completed" | "failed";
+  status: "active" | "ready" | "failed" | "cancelled";
+  stage: string;
+  failure_category?: string | null;
+  retryable: boolean;
+  attempt_count: number;
+  last_attempted_at?: string | null;
+  processed_chunk_count: number;
+  graph_node_count: number;
+  graph_edge_count: number;
   error_message?: string | null;
   result_json?: Record<string, unknown> | null;
   created_at: string;
@@ -173,4 +201,28 @@ export async function getUploadStatus(taskId: string): Promise<UploadStatusRespo
   });
 
   return response.json() as Promise<UploadStatusResponse>;
+}
+
+export async function listUploads(): Promise<UploadStatusResponse[]> {
+  const response = await fetchWithTimeout(`${API_BASE_URL}/ingest/uploads`, {
+    method: "GET",
+    timeout: 15000,
+  });
+
+  return response.json() as Promise<UploadStatusResponse[]>;
+}
+
+export async function retryUpload(uploadId: string): Promise<IngestResponse> {
+  const response = await fetchWithTimeout(
+    `${API_BASE_URL}/ingest/uploads/${uploadId}/retry`,
+    { method: "POST", timeout: 15000 },
+  );
+  return response.json() as Promise<IngestResponse>;
+}
+
+export async function removeFailedUpload(uploadId: string): Promise<void> {
+  await fetchWithTimeout(`${API_BASE_URL}/ingest/uploads/${uploadId}`, {
+    method: "DELETE",
+    timeout: 15000,
+  });
 }

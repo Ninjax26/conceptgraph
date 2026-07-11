@@ -7,7 +7,8 @@ import torch
 from groq import Groq
 from neo4j import AsyncDriver
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams
+from qdrant_client.http.exceptions import UnexpectedResponse
+from qdrant_client.models import Distance, FieldCondition, Filter, FilterSelector, MatchValue, PointStruct, VectorParams
 from sentence_transformers import SentenceTransformer
 
 from app.core.config import settings
@@ -68,27 +69,21 @@ class IngestionService:
         self,
         chunks: Sequence[DocumentChunk],
     ) -> GraphExtractionResponse:
-        merged = GraphExtractionResponse()
-        seen_nodes: set[str] = set()
-        seen_relationships: set[tuple[str, str, str]] = set()
+        if not chunks:
+            return GraphExtractionResponse()
 
-        for chunk in chunks:
-            extracted = await self.extract_graph_from_text(chunk.text)
-            for node in extracted.nodes:
-                if node.id not in seen_nodes:
-                    merged.nodes.append(node)
-                    seen_nodes.add(node.id)
-            for relationship in extracted.relationships:
-                relationship_key = (
-                    relationship.source_node_id,
-                    relationship.target_node_id,
-                    relationship.relation_type,
-                )
-                if relationship_key not in seen_relationships:
-                    merged.relationships.append(relationship)
-                    seen_relationships.add(relationship_key)
-
-        return merged
+        # One representative request avoids rate-limit failures from making an
+        # LLM call for every vector chunk. All chunks are still indexed for search.
+        sample_count = min(8, len(chunks))
+        sample_indexes = {
+            round(index * (len(chunks) - 1) / max(sample_count - 1, 1))
+            for index in range(sample_count)
+        }
+        context = "\n\n".join(
+            f"[Document excerpt {index + 1}]\n{chunks[index].text[:700]}"
+            for index in sorted(sample_indexes)
+        )
+        return await self.extract_graph_from_text(context)
 
     async def extract_graph_from_text(self, text: str) -> GraphExtractionResponse:
         provider = settings.llm_provider.lower()
@@ -102,15 +97,20 @@ class IngestionService:
         self,
         extraction: GraphExtractionResponse,
         course_id: str,
-        week_number: int,
+        *,
+        upload_id: str,
+        document_name: str,
+        course_name: str = "",
     ) -> None:
         async with self.graph_driver.session() as session:
             await session.run(
                 """
                 MERGE (course:Course {id: $course_id})
-                SET course.updated_at = datetime()
+                SET course.name = $course_name,
+                    course.updated_at = datetime()
                 """,
                 course_id=course_id,
+                course_name=course_name,
             )
 
             for node in extraction.nodes:
@@ -122,18 +122,20 @@ class IngestionService:
                         c.description = $description,
                         c.source_id = $source_id,
                         c.course_id = $course_id,
-                        c.week = $week_number
+                        c.upload_id = $upload_id,
+                        c.document_name = $document_name
                     WITH c
                     MATCH (course:Course {id: $course_id})
                     MERGE (course)-[:CONTAINS]->(c)
                     """,
-                    id=self._scoped_concept_id(course_id, node.id),
+                    id=self._scoped_concept_id(course_id, upload_id, node.id),
                     source_id=node.id,
                     name=node.name,
                     type=node.type,
                     description=node.description,
                     course_id=course_id,
-                    week_number=week_number,
+                    upload_id=upload_id,
+                    document_name=document_name,
                 )
 
             for relationship in extraction.relationships:
@@ -148,47 +150,83 @@ class IngestionService:
                     MERGE (source)-[r:{relation_type} {{course_id: $course_id}}]->(target)
                     SET r.relation_type = $relation_type,
                         r.course_id = $course_id,
-                        r.week = $week_number
+                        r.upload_id = $upload_id,
+                        r.document_name = $document_name
                     """,
                     course_id=course_id,
                     source_node_id=self._scoped_concept_id(
                         course_id,
+                        upload_id,
                         relationship.source_node_id,
                     ),
                     target_node_id=self._scoped_concept_id(
                         course_id,
+                        upload_id,
                         relationship.target_node_id,
                     ),
                     relation_type=relationship.relation_type,
-                    week_number=week_number,
+                    upload_id=upload_id,
+                    document_name=document_name,
                 )
 
     async def ingest_chunks(self, chunks: Sequence[DocumentChunk]) -> dict[str, int]:
         self._validate_llm_configured()
         course_id = self._course_id_from_chunks(chunks)
-        week_number = self._week_number_from_chunks(chunks)
-        vector_count = self.upsert_chunks_to_qdrant(chunks)
         graph_extraction = await self.extract_graph_from_chunks(chunks)
         await self.store_graph_extraction(
             graph_extraction,
             course_id=course_id,
-            week_number=week_number,
+            upload_id=str(chunks[0].metadata.get("upload_id", "")),
+            document_name=str(chunks[0].metadata.get("document_name", "")),
         )
+        vector_count = self.upsert_chunks_to_qdrant(chunks)
         return {
             "chunks_indexed": vector_count,
             "nodes_upserted": len(graph_extraction.nodes),
             "relationships_upserted": len(graph_extraction.relationships),
         }
 
+    async def cleanup_upload(self, upload_id: str, course_id: str) -> None:
+        if self._collection_exists_for_cleanup():
+            self.vector_client.delete(
+                collection_name=self.collection_name,
+                points_selector=FilterSelector(
+                    filter=Filter(
+                        must=[FieldCondition(key="upload_id", match=MatchValue(value=upload_id))]
+                    )
+                ),
+                wait=True,
+            )
+        async with self.graph_driver.session() as session:
+            await session.run(
+                """
+                MATCH (course:Course {id: $course_id})-[:CONTAINS]->(concept:Concept {upload_id: $upload_id})
+                DETACH DELETE concept
+                """,
+                course_id=course_id,
+                upload_id=upload_id,
+            )
+
+    def _collection_exists_for_cleanup(self) -> bool:
+        try:
+            return bool(self.vector_client.collection_exists(self.collection_name))
+        except Exception:
+            return False
+
     def _ensure_qdrant_collection(self, vector_size: int) -> None:
         existing_collections = self.vector_client.get_collections().collections
         if any(collection.name == self.collection_name for collection in existing_collections):
             return
 
-        self.vector_client.create_collection(
-            collection_name=self.collection_name,
-            vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
-        )
+        try:
+            self.vector_client.create_collection(
+                collection_name=self.collection_name,
+                vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
+            )
+        except UnexpectedResponse as exc:
+            if exc.status_code == 409 or b"already exists" in exc.content.lower():
+                return
+            raise
 
     def _extract_with_groq(self, text: str) -> GraphExtractionResponse:
         if not settings.groq_api_key:
@@ -284,15 +322,5 @@ class IngestionService:
         return course_id
 
     @staticmethod
-    def _week_number_from_chunks(chunks: Sequence[DocumentChunk]) -> int:
-        if not chunks:
-            raise ValueError("Cannot ingest an empty chunk list.")
-
-        week_number = chunks[0].metadata.get("week")
-        if not isinstance(week_number, int) or week_number < 1:
-            raise ValueError("Chunk metadata must include a valid week number.")
-        return week_number
-
-    @staticmethod
-    def _scoped_concept_id(course_id: str, concept_id: str) -> str:
-        return f"{course_id}:{concept_id}"
+    def _scoped_concept_id(course_id: str, upload_id: str, concept_id: str) -> str:
+        return f"{course_id}:{upload_id}:{concept_id}"

@@ -1,7 +1,7 @@
 """Syllabus-Bounded Exam Generator service.
 
-Retrieves text chunks from Qdrant using strict metadata filtering (course_id
-+ week_number) and instructs the LLM to generate a multiple-choice exam
+Retrieves text chunks from Qdrant using strict course filtering and instructs
+the LLM to generate a multiple-choice exam
 purely from the retrieved syllabus content.
 """
 
@@ -12,12 +12,14 @@ from typing import Any
 
 from groq import Groq
 from qdrant_client import QdrantClient
-from qdrant_client.models import FieldCondition, Filter, MatchValue, ScrollRequest
+from qdrant_client.http.exceptions import UnexpectedResponse
+from qdrant_client.models import FieldCondition, Filter, MatchAny
 
 from app.core.config import settings
 from app.core.database import qdrant_client as default_qdrant_client
 from app.core.exceptions import LLMConfigurationError
 from app.schemas.exam import ExamResponse, MockQuestion
+from app.services.course_service import ReadyCourseContext
 
 logger = logging.getLogger(__name__)
 
@@ -38,13 +40,12 @@ class ExamService:
 
     async def generate_exam(
         self,
-        course_id: str,
-        week_number: int,
+        context: ReadyCourseContext,
         num_questions: int = 5,
     ) -> ExamResponse:
         """End-to-end exam generation pipeline.
 
-        1. Metadata-filter Qdrant for chunks matching (course_id, week).
+        1. Metadata-filter Qdrant for chunks matching the course.
         2. Concatenate the chunk texts into a bounded context window.
         3. Ask the LLM to produce *num_questions* MCQs strictly from that
            context, returning structured JSON conforming to ExamResponse.
@@ -52,20 +53,18 @@ class ExamService:
         # Step 1 – metadata-filtered retrieval
         chunks = await asyncio.to_thread(
             self._retrieve_chunks_by_metadata,
-            course_id,
-            week_number,
+            context.document_ids,
         )
 
         if not chunks:
             logger.warning(
-                "No chunks found for course_id=%s, week=%d – returning empty exam.",
-                course_id,
-                week_number,
+                "No chunks found for course_id=%s; returning empty exam.",
+                context.course.display_name,
             )
             return ExamResponse(
-                course_id=course_id,
-                week_number=week_number,
+                course_id=context.course.id,
                 questions=[],
+                source_count=0,
             )
 
         # Step 2 – constrained generation
@@ -74,11 +73,15 @@ class ExamService:
             context_text=context_text,
             num_questions=num_questions,
         )
+        if len(questions) != num_questions:
+            raise RuntimeError(
+                f"Exam generation produced {len(questions)} valid questions; expected {num_questions}."
+            )
 
         return ExamResponse(
-            course_id=course_id,
-            week_number=week_number,
+            course_id=context.course.id,
             questions=questions,
+            source_count=min(6, len(chunks)),
         )
 
     # ------------------------------------------------------------------
@@ -87,8 +90,7 @@ class ExamService:
 
     def _retrieve_chunks_by_metadata(
         self,
-        course_id: str,
-        week_number: int,
+        document_ids: list[str],
         batch_size: int = 100,
     ) -> list[dict[str, Any]]:
         """Scroll through Qdrant with a strict metadata filter.
@@ -103,12 +105,8 @@ class ExamService:
         query_filter = Filter(
             must=[
                 FieldCondition(
-                    key="document_id",
-                    match=MatchValue(value=course_id),
-                ),
-                FieldCondition(
-                    key="week",
-                    match=MatchValue(value=week_number),
+                    key="upload_id",
+                    match=MatchAny(any=document_ids),
                 ),
             ]
         )
@@ -130,14 +128,25 @@ class ExamService:
                     scroll_kwargs["offset"] = offset
 
                 points, next_offset = self.vector_client.scroll(**scroll_kwargs)
+            except UnexpectedResponse as exc:
+                if self._is_qdrant_not_found_error(exc):
+                    logger.info("Qdrant collection %s does not exist yet.", self.collection_name)
+                    return []
+                raise
             except TypeError:
                 # Older qdrant-client versions use positional / different kwarg names.
-                points, next_offset = self.vector_client.scroll(
-                    collection_name=self.collection_name,
-                    scroll_filter=query_filter,
-                    limit=batch_size,
-                    with_payload=True,
-                )
+                try:
+                    points, next_offset = self.vector_client.scroll(
+                        collection_name=self.collection_name,
+                        scroll_filter=query_filter,
+                        limit=batch_size,
+                        with_payload=True,
+                    )
+                except UnexpectedResponse as exc:
+                    if self._is_qdrant_not_found_error(exc):
+                        logger.info("Qdrant collection %s does not exist yet.", self.collection_name)
+                        return []
+                    raise
 
             for point in points:
                 payload = point.payload or {}
@@ -158,10 +167,9 @@ class ExamService:
             offset = next_offset
 
         logger.info(
-            "Retrieved %d chunks for course_id=%s, week=%d",
+            "Retrieved %d chunks for %d ready documents",
             len(all_chunks),
-            course_id,
-            week_number,
+            len(document_ids),
         )
         return all_chunks
 
@@ -172,6 +180,10 @@ class ExamService:
                     collection_name=self.collection_name,
                 )
             )
+        except UnexpectedResponse as exc:
+            if self._is_qdrant_not_found_error(exc):
+                return False
+            raise
         except AttributeError:
             try:
                 self.vector_client.get_collection(collection_name=self.collection_name)
@@ -180,6 +192,10 @@ class ExamService:
                     return False
                 raise
             return True
+
+    @staticmethod
+    def _is_qdrant_not_found_error(exc: UnexpectedResponse) -> bool:
+        return exc.status_code == 404 and b"Collection" in exc.content
 
     # ------------------------------------------------------------------
     # Step 2: Constrained LLM generation
@@ -287,11 +303,18 @@ class ExamService:
 
     @staticmethod
     def _build_context(chunks: list[dict[str, Any]]) -> str:
-        """Concatenate chunk texts into a single bounded context string."""
+        """Build a representative context that stays within provider limits."""
+        if not chunks:
+            return ""
+        sample_count = min(6, len(chunks))
+        sample_indexes = {
+            round(index * (len(chunks) - 1) / max(sample_count - 1, 1))
+            for index in range(sample_count)
+        }
         return "\n\n".join(
-            f"[Chunk {i + 1}]\n{chunk['text']}"
-            for i, chunk in enumerate(chunks)
-            if chunk.get("text")
+            f"[Course excerpt {index + 1}]\n{str(chunks[index].get('text', ''))[:600]}"
+            for index in sorted(sample_indexes)
+            if chunks[index].get("text")
         )
 
     @staticmethod
@@ -301,7 +324,7 @@ class ExamService:
             data = json.loads(raw_json)
         except json.JSONDecodeError as exc:
             logger.error("LLM returned invalid JSON: %s", exc)
-            return []
+            raise RuntimeError("LLM returned invalid exam JSON.") from exc
 
         # The LLM may return {"questions": [...]} or just [...]
         question_dicts: list[dict[str, Any]]
@@ -311,7 +334,7 @@ class ExamService:
             question_dicts = data.get("questions", [])
         else:
             logger.error("Unexpected LLM response structure: %s", type(data))
-            return []
+            raise RuntimeError("LLM returned an unexpected exam JSON structure.")
 
         questions: list[MockQuestion] = []
         for item in question_dicts:

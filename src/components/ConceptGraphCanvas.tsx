@@ -5,7 +5,8 @@ import cytoscape, {
   type NodeSingular,
   type EdgeSingular,
 } from "cytoscape";
-import { useEffect, useRef } from "react";
+import { Maximize2, X } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 
 export interface GraphCanvasNode {
   id: string;
@@ -32,6 +33,7 @@ export default function ConceptGraphCanvas({
 }: ConceptGraphCanvasProps): JSX.Element {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const cyRef = useRef<Core | null>(null);
+  const [selectedNode, setSelectedNode] = useState<GraphCanvasNode | null>(null);
 
   // Initialize Cytoscape instance once
   useEffect(() => {
@@ -44,7 +46,6 @@ export default function ConceptGraphCanvas({
       elements: [],
       minZoom: 0.35,
       maxZoom: 2.4,
-      wheelSensitivity: 0.18,
       layout: {
         name: "cose",
         animate: false,
@@ -79,6 +80,7 @@ export default function ConceptGraphCanvas({
           style: {
             "curve-style": "bezier",
             "font-size": 10,
+            label: "data(label)",
             "line-color": "#a7b5c1",
             "target-arrow-color": "#a7b5c1",
             "target-arrow-shape": "triangle",
@@ -121,6 +123,12 @@ export default function ConceptGraphCanvas({
 
     cy.on("tap", "node", async (event) => {
       const selected = event.target as NodeSingular;
+      setSelectedNode({
+        id: selected.id(),
+        label: String(selected.data("label")),
+        type: String(selected.data("type")),
+        description: String(selected.data("description")),
+      });
 
       // Reset and dim everything first
       cy.elements().removeClass("selectedPath dimmed");
@@ -185,6 +193,7 @@ export default function ConceptGraphCanvas({
     cy.on("tap", (event) => {
       if (event.target === cy) {
         cy.elements().removeClass("selectedPath dimmed");
+        setSelectedNode(null);
       }
     });
 
@@ -200,6 +209,7 @@ export default function ConceptGraphCanvas({
     if (!cy) return;
 
     cy.elements().remove(); // Clear previous data
+    setSelectedNode(null);
 
     if (nodes.length === 0 && edges.length === 0) {
       return;
@@ -248,6 +258,33 @@ export default function ConceptGraphCanvas({
         </div>
       ) : null}
       <div ref={containerRef} className="absolute inset-0" />
+      {nodes.length > 0 ? (
+        <button
+          aria-label="Fit graph to view"
+          className="absolute right-3 top-3 z-10 grid h-9 w-9 place-items-center rounded-md border border-slate-200 bg-white text-slate-600 shadow-sm hover:bg-slate-50"
+          onClick={() => cyRef.current?.fit(undefined, 48)}
+          type="button"
+        >
+          <Maximize2 className="h-4 w-4" />
+        </button>
+      ) : null}
+      {selectedNode ? (
+        <aside className="absolute bottom-3 left-3 right-3 z-10 rounded-md border border-slate-200 bg-white/95 p-3 shadow-lg backdrop-blur sm:right-auto sm:max-w-sm">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <p className="text-sm font-semibold text-ink">{selectedNode.label}</p>
+              <p className="mt-0.5 text-[10px] font-semibold uppercase tracking-wide text-teal-700">{selectedNode.type || "concept"}</p>
+            </div>
+            <button aria-label="Close concept details" className="rounded p-1 text-slate-400 hover:bg-slate-100" onClick={() => {
+              setSelectedNode(null);
+              cyRef.current?.elements().removeClass("selectedPath dimmed");
+            }} type="button">
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+          <p className="mt-2 text-xs leading-5 text-slate-600">{selectedNode.description || "No description was extracted for this concept."}</p>
+        </aside>
+      ) : null}
     </div>
   );
 }

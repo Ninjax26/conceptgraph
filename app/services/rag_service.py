@@ -10,11 +10,13 @@ from groq import Groq
 from neo4j import AsyncDriver
 from pydantic import BaseModel, ConfigDict, Field
 from qdrant_client import QdrantClient
-from qdrant_client.models import FieldCondition, Filter, MatchValue
+from qdrant_client.http.exceptions import UnexpectedResponse
+from qdrant_client.models import FieldCondition, Filter, MatchAny
 from sentence_transformers import SentenceTransformer
 
 from app.core.config import settings
 from app.core.database import neo4j_driver, qdrant_client
+from app.services.course_service import ReadyCourseContext
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +33,7 @@ class GraphRetrievalResult:
     concepts: list[dict[str, Any]]
     prerequisite_names: list[str]
     cypher: str
+    metadata: dict[str, Any]
 
 
 class RetrievalService:
@@ -47,50 +50,39 @@ class RetrievalService:
     async def retrieve(
         self,
         question: str,
-        course_id: str,
-        week_number: int,
+        context: ReadyCourseContext,
         top_k: int = 10,
     ) -> dict[str, Any]:
         graph_result = await self.execute_graph_retrieval(
             question=question,
-            course_id=course_id,
-            week_number=week_number,
+            context=context,
         )
         chunks = await asyncio.to_thread(
             self.search_qdrant,
             question,
             graph_result.prerequisite_names,
-            course_id,
-            week_number,
+            context.document_ids,
             top_k,
         )
         return {
             "graph_context": graph_result.concepts,
             "graph_cypher": graph_result.cypher,
             "chunks": chunks,
+            "graph_metadata": graph_result.metadata,
         }
 
     async def execute_graph_retrieval(
         self,
         question: str,
-        course_id: str,
-        week_number: int,
+        context: ReadyCourseContext,
     ) -> GraphRetrievalResult:
-        try:
-            generated = await self.generate_cypher(question, week_number)
-            cypher = self._validate_read_only_cypher(generated.cypher)
-            if "$course_id" not in cypher or "$week_number" not in cypher:
-                generated = self._fallback_cypher(question, week_number)
-                cypher = self._validate_read_only_cypher(generated.cypher)
-        except Exception as exc:
-            logger.warning("Falling back to local course-scoped Cypher: %s", exc)
-            generated = self._fallback_cypher(question, week_number)
-            cypher = self._validate_read_only_cypher(generated.cypher)
+        generated = self._fallback_cypher(question)
+        cypher = self._validate_read_only_cypher(generated.cypher)
         parameters = {
             **generated.parameters,
             "question": question,
-            "course_id": course_id,
-            "week_number": week_number,
+            "course_ids": context.graph_course_ids,
+            "document_ids": context.document_ids,
         }
 
         async with self.graph_driver.session() as session:
@@ -98,7 +90,13 @@ class RetrievalService:
             records = await result.data()
 
             if not records:
-                records = await self._fetch_course_graph(session, course_id, week_number)
+                records = await self._fetch_course_graph(
+                    session, context.graph_course_ids, context.document_ids
+                )
+
+            totals = await self._fetch_graph_totals(
+                session, context.graph_course_ids, context.document_ids
+            )
 
         concepts: list[dict[str, Any]] = []
         prerequisite_names: list[str] = []
@@ -109,7 +107,15 @@ class RetrievalService:
                 for node in record.get("prerequisites", [])
                 if node is not None
             ]
-            concepts.append({"concept": concept, "prerequisites": prerequisites})
+            concepts.append({
+                "concept": concept,
+                "prerequisites": prerequisites,
+                "relationships": [
+                    self._relationship_to_dict(rel)
+                    for rel in record.get("relationships", [])
+                    if rel is not None
+                ],
+            })
             prerequisite_names.extend(
                 str(node["name"])
                 for node in prerequisites
@@ -120,21 +126,30 @@ class RetrievalService:
             concepts=concepts,
             prerequisite_names=sorted(set(prerequisite_names)),
             cypher=cypher,
+            metadata={
+                **totals,
+                "displayed_nodes": len({
+                    node.get("id")
+                    for item in concepts
+                    for node in [item["concept"], *item["prerequisites"]]
+                    if node.get("id")
+                }),
+                "displayed_edges": sum(len(item["relationships"]) for item in concepts),
+                "filter_reason": "query_subgraph",
+            },
         )
 
-    async def generate_cypher(self, question: str, week_number: int) -> CypherGenerationResponse:
+    async def generate_cypher(self, question: str) -> CypherGenerationResponse:
         provider = settings.llm_provider.lower()
         if provider == "gemini":
             return await asyncio.to_thread(
                 self._generate_cypher_with_gemini,
                 question,
-                week_number,
             )
         if provider == "groq":
             return await asyncio.to_thread(
                 self._generate_cypher_with_groq,
                 question,
-                week_number,
             )
         raise ValueError(f"Unsupported LLM_PROVIDER: {settings.llm_provider}")
 
@@ -142,8 +157,7 @@ class RetrievalService:
         self,
         question: str,
         prerequisite_names: list[str],
-        course_id: str,
-        week_number: int,
+        document_ids: list[str],
         top_k: int = 10,
     ) -> list[dict[str, Any]]:
         if not self._collection_exists():
@@ -160,12 +174,8 @@ class RetrievalService:
         query_filter = Filter(
             must=[
                 FieldCondition(
-                    key="document_id",
-                    match=MatchValue(value=course_id),
-                ),
-                FieldCondition(
-                    key="week",
-                    match=MatchValue(value=week_number),
+                    key="upload_id",
+                    match=MatchAny(any=document_ids),
                 )
             ]
         )
@@ -178,14 +188,25 @@ class RetrievalService:
                 limit=top_k,
                 with_payload=True,
             ).points
+        except UnexpectedResponse as exc:
+            if self._is_qdrant_not_found_error(exc):
+                logger.info("Qdrant collection %s does not exist yet.", self.collection_name)
+                return []
+            raise
         except AttributeError:
-            results = self.vector_client.search(
-                collection_name=self.collection_name,
-                query_vector=query_vector,
-                query_filter=query_filter,
-                limit=top_k,
-                with_payload=True,
-            )
+            try:
+                results = self.vector_client.search(
+                    collection_name=self.collection_name,
+                    query_vector=query_vector,
+                    query_filter=query_filter,
+                    limit=top_k,
+                    with_payload=True,
+                )
+            except UnexpectedResponse as exc:
+                if self._is_qdrant_not_found_error(exc):
+                    logger.info("Qdrant collection %s does not exist yet.", self.collection_name)
+                    return []
+                raise
 
         chunks: list[dict[str, Any]] = []
         for point in results:
@@ -220,6 +241,10 @@ class RetrievalService:
                     collection_name=self.collection_name,
                 )
             )
+        except UnexpectedResponse as exc:
+            if self._is_qdrant_not_found_error(exc):
+                return False
+            raise
         except AttributeError:
             try:
                 self.vector_client.get_collection(collection_name=self.collection_name)
@@ -229,13 +254,16 @@ class RetrievalService:
                 raise
             return True
 
+    @staticmethod
+    def _is_qdrant_not_found_error(exc: UnexpectedResponse) -> bool:
+        return exc.status_code == 404 and b"Collection" in exc.content
+
     def _generate_cypher_with_groq(
         self,
         question: str,
-        week_number: int,
     ) -> CypherGenerationResponse:
         if not settings.groq_api_key:
-            return self._fallback_cypher(question, week_number)
+            return self._fallback_cypher(question)
 
         client = Groq(api_key=settings.groq_api_key)
         completion = client.chat.completions.create(
@@ -253,10 +281,9 @@ class RetrievalService:
     def _generate_cypher_with_gemini(
         self,
         question: str,
-        week_number: int,
     ) -> CypherGenerationResponse:
         if not settings.gemini_api_key:
-            return self._fallback_cypher(question, week_number)
+            return self._fallback_cypher(question)
 
         import google.generativeai as genai
 
@@ -277,10 +304,9 @@ class RetrievalService:
         return (
             "Generate a single read-only Neo4j Cypher query for an academic concept graph. "
             "The graph uses (:Course {id}) nodes connected to "
-            "(:Concept {id, name, type, description, week}) nodes by [:CONTAINS]. "
+            "(:Concept {id, name, type, description}) nodes by [:CONTAINS]. "
             "Always scope the query to MATCH (course:Course {id: $course_id}) and only "
-            "return concepts contained by that course and the requested week_number. "
-            "Always include `week_number` in any concept or prerequisite filters. "
+            "return only concepts contained by that course. "
             "The query must return a variable named concept and a variable named prerequisites. "
             "prerequisites must contain prerequisite Concept nodes up to 2 hops away. "
             "Use parameters instead of interpolating user text. Do not write, merge, delete, "
@@ -289,7 +315,7 @@ class RetrievalService:
         )
 
     @staticmethod
-    def _fallback_cypher(question: str, week_number: int) -> CypherGenerationResponse:
+    def _fallback_cypher(question: str) -> CypherGenerationResponse:
         terms = [
             term.lower()
             for term in re.findall(r"[A-Za-z][A-Za-z0-9_+-]{2,}", question)
@@ -297,12 +323,14 @@ class RetrievalService:
         ][:12]
         return CypherGenerationResponse(
             cypher="""
-            MATCH (course:Course {id: $course_id})-[:CONTAINS]->(concept:Concept)
-            WHERE concept.week = $week_number
+            MATCH (course:Course)-[:CONTAINS]->(concept:Concept)
+            WHERE course.id IN $course_ids
+              AND concept.upload_id IN $document_ids
               AND any(term IN $terms WHERE toLower(concept.name) CONTAINS term)
-            OPTIONAL MATCH (prerequisite:Concept)-[*1..2]->(concept)
-            WHERE prerequisite IS NULL OR ((course)-[:CONTAINS]->(prerequisite) AND prerequisite.week = $week_number)
-            RETURN concept, collect(DISTINCT prerequisite) AS prerequisites
+            OPTIONAL MATCH (prerequisite:Concept)-[relationship]->(concept)
+            WHERE prerequisite IS NULL OR ((course)-[:CONTAINS]->(prerequisite) AND prerequisite.upload_id IN $document_ids)
+            RETURN concept, collect(DISTINCT prerequisite) AS prerequisites,
+                   collect(DISTINCT relationship) AS relationships
             LIMIT 5
             """,
             parameters={"terms": terms or [question.lower()]},
@@ -328,6 +356,16 @@ class RetrievalService:
         return dict(node)
 
     @staticmethod
+    def _relationship_to_dict(relationship: Any) -> dict[str, Any]:
+        return {
+            **dict(relationship),
+            "type": relationship.type,
+            "source": relationship.start_node.get("id"),
+            "target": relationship.end_node.get("id"),
+            "direction": "outgoing",
+        }
+
+    @staticmethod
     def _build_expanded_query(question: str, prerequisite_names: list[str]) -> str:
         if not prerequisite_names:
             return question
@@ -337,23 +375,46 @@ class RetrievalService:
     async def _fetch_course_graph(
         self,
         session,
-        course_id: str,
-        week_number: int,
+        course_ids: list[str],
+        document_ids: list[str],
     ) -> list[dict[str, Any]]:
         result = await session.run(
             """
-            MATCH (course:Course {id: $course_id})-[:CONTAINS]->(concept:Concept)
-            WHERE concept.week = $week_number
-            OPTIONAL MATCH (prerequisite:Concept)-[*1..2]->(concept)
-            WHERE prerequisite IS NULL OR ((course)-[:CONTAINS]->(prerequisite) AND prerequisite.week = $week_number)
-            RETURN concept, collect(DISTINCT prerequisite) AS prerequisites
+            MATCH (course:Course)-[:CONTAINS]->(concept:Concept)
+            WHERE course.id IN $course_ids
+              AND concept.upload_id IN $document_ids
+            OPTIONAL MATCH (prerequisite:Concept)-[relationship]->(concept)
+            WHERE prerequisite IS NULL OR ((course)-[:CONTAINS]->(prerequisite) AND prerequisite.upload_id IN $document_ids)
+            RETURN concept, collect(DISTINCT prerequisite) AS prerequisites,
+                   collect(DISTINCT relationship) AS relationships
             ORDER BY concept.name
             LIMIT 50
             """,
-            course_id=course_id,
-            week_number=week_number,
+            course_ids=course_ids,
+            document_ids=document_ids,
         )
         return await result.data()
+
+    async def _fetch_graph_totals(
+        self, session, course_ids: list[str], document_ids: list[str]
+    ) -> dict[str, int]:
+        result = await session.run(
+            """
+            MATCH (course:Course)-[:CONTAINS]->(concept:Concept)
+            WHERE course.id IN $course_ids
+              AND concept.upload_id IN $document_ids
+            OPTIONAL MATCH (concept)-[relationship]->(:Concept)
+            RETURN count(DISTINCT concept) AS total_nodes,
+                   count(DISTINCT relationship) AS total_edges
+            """,
+            course_ids=course_ids,
+            document_ids=document_ids,
+        )
+        record = await result.single()
+        return {
+            "total_nodes": int(record["total_nodes"] if record else 0),
+            "total_edges": int(record["total_edges"] if record else 0),
+        }
 
     @staticmethod
     def _resolve_embedding_device() -> str:

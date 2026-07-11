@@ -6,7 +6,7 @@ response so that generated exams are always valid, well-typed JSON.
 
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictStr, model_validator
 
 
 class MockQuestion(BaseModel):
@@ -47,5 +47,5 @@ class ExamResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     course_id: Annotated[StrictStr, Field(min_length=1)]
-    week_number: Annotated[StrictInt, Field(ge=1)]
     questions: list[MockQuestion] = Field(default_factory=list)
+    source_count: int = Field(default=0, ge=0)

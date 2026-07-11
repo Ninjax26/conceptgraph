@@ -40,35 +40,54 @@ class ParserService:
         file_path: str,
         document_id: str,
         upload_id: str,
-        week_number: int = 1,
+        document_name: str = "",
     ) -> list[DocumentChunk]:
-        chunks: list[DocumentChunk] = []
+        pages = self.extract_pages(file_path)
+        return self.chunk_pages(pages, file_path, document_id, upload_id, document_name)
+
+    def extract_pages(self, file_path: str) -> list[tuple[int, str]]:
         pdf_path = Path(file_path)
         if not pdf_path.exists():
             raise FileNotFoundError(f"PDF file not found: {file_path}")
-
+        pages: list[tuple[int, str]] = []
         with fitz.open(pdf_path) as document:
             for page_index, page in enumerate(document, start=1):
                 text = page.get_text("text").strip()
-                if not text:
-                    continue
+                if text:
+                    pages.append((page_index, text))
+        return pages
 
-                raw_chunks = self.text_splitter.create_documents(
+    def chunk_pages(
+        self,
+        pages: list[tuple[int, str]],
+        file_path: str,
+        document_id: str,
+        upload_id: str,
+        document_name: str = "",
+    ) -> list[DocumentChunk]:
+        chunks: list[DocumentChunk] = []
+        for page_index, text in pages:
+            section_heading = next(
+                (line.strip() for line in text.splitlines() if 3 <= len(line.strip()) <= 120),
+                None,
+            )
+            raw_chunks = self.text_splitter.create_documents(
                     texts=[text],
                     metadatas=[
                         {
                             "document_id": document_id,
                             "upload_id": upload_id,
+                            "document_name": document_name,
                             "source_path": file_path,
                             "page_number": page_index,
-                            "week": week_number,
+                            "section_heading": section_heading or "",
                         }
                     ],
                 )
 
-                for index, chunk in enumerate(raw_chunks):
-                    chunk_id = f"{upload_id}:{page_index}:{index}"
-                    chunks.append(
+            for index, chunk in enumerate(raw_chunks):
+                chunk_id = f"{upload_id}:{page_index}:{index}"
+                chunks.append(
                         DocumentChunk(
                             id=chunk_id,
                             text=chunk.page_content,
@@ -77,12 +96,13 @@ class ParserService:
                                 "chunk_index": index,
                                 "document_id": document_id,
                                 "upload_id": upload_id,
+                                "document_name": document_name,
                                 "source_path": file_path,
                                 "page_number": page_index,
-                                "week": week_number,
+                                "section_heading": section_heading or "",
                             },
                         )
-                    )
+                )
 
         return chunks
 

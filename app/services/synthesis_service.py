@@ -19,24 +19,23 @@ class SynthesisService:
         self,
         question: str,
         graph_context: list[dict[str, Any]],
-        ranked_chunks: list[dict[str, Any]],
+        sources: list[dict[str, Any]],
     ) -> str:
         self.validate_provider_configured()
-        top_chunks = ranked_chunks[:4]
         provider = settings.llm_provider.lower()
         if provider == "gemini":
             return await asyncio.to_thread(
                 self._synthesize_with_gemini,
                 question,
                 graph_context,
-                top_chunks,
+                sources,
             )
         if provider == "groq":
             return await asyncio.to_thread(
                 self._synthesize_with_groq,
                 question,
                 graph_context,
-                top_chunks,
+                sources,
             )
         raise ValueError(f"Unsupported LLM_PROVIDER: {settings.llm_provider}")
 
@@ -44,14 +43,14 @@ class SynthesisService:
         self,
         question: str,
         graph_context: list[dict[str, Any]],
-        chunks: list[dict[str, Any]],
+        sources: list[dict[str, Any]],
     ) -> str:
         client = Groq(api_key=settings.groq_api_key)
         completion = client.chat.completions.create(
             model=settings.groq_model,
             messages=[
                 {"role": "system", "content": self._system_prompt()},
-                {"role": "user", "content": self._user_prompt(question, graph_context, chunks)},
+                {"role": "user", "content": self._user_prompt(question, graph_context, sources)},
             ],
             temperature=0,
         )
@@ -61,7 +60,7 @@ class SynthesisService:
         self,
         question: str,
         graph_context: list[dict[str, Any]],
-        chunks: list[dict[str, Any]],
+        sources: list[dict[str, Any]],
     ) -> str:
         import google.generativeai as genai
 
@@ -70,7 +69,7 @@ class SynthesisService:
         response = model.generate_content(
             [
                 self._system_prompt(),
-                self._user_prompt(question, graph_context, chunks),
+                self._user_prompt(question, graph_context, sources),
             ],
             generation_config={"temperature": 0},
         )
@@ -81,27 +80,27 @@ class SynthesisService:
         return (
             "You are ConceptGraph, a syllabus-bounded academic assistant. Answer strictly "
             "from the provided textbook chunks and graph context. Do not use outside knowledge. "
-            "If the answer cannot be confidently derived from the provided context, state: "
-            "\"The answer is not present in the current syllabus boundaries.\" "
-            "Cite chunk ids when using evidence."
+            "Cite evidence using only readable labels such as [Source 1] or [Source 2, p. 6]. "
+            "Never mention chunk IDs, UUIDs, vector IDs, database IDs, file paths, or scores. "
+            "If evidence is insufficient, state exactly: \"I could not find enough reliable "
+            "course content to answer this confidently.\""
         )
 
     @staticmethod
     def _user_prompt(
         question: str,
         graph_context: list[dict[str, Any]],
-        chunks: list[dict[str, Any]],
+        sources: list[dict[str, Any]],
     ) -> str:
-        chunk_context = "\n\n".join(
-            (
-                f"Chunk ID: {chunk.get('id')}\n"
-                f"Score: {chunk.get('rerank_score', chunk.get('score'))}\n"
-                f"Text:\n{chunk.get('text', '')}"
-            )
-            for chunk in chunks
+        source_context = "\n\n".join(
+            f"[Source {index}] | {source['document_name']} | "
+            f"page {source.get('page_number') or 'unknown'} | "
+            f"section {source.get('section_heading') or 'unknown'}\n"
+            f"{source['supporting_passage']}"
+            for index, source in enumerate(sources, start=1)
         )
         return (
             f"Question:\n{question}\n\n"
             f"Graph context:\n{graph_context}\n\n"
-            f"Textbook chunks:\n{chunk_context}"
+            f"Course sources:\n{source_context}"
         )
