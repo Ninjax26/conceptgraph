@@ -157,7 +157,7 @@ Failure path: worker catches `LLMConfigurationError` or any `Exception`, classif
 ### 3.2 Status, history, retry, preview, deletion
 
 - The dashboard loads `listUploads()` and `listCourses()` together on mount. The dedicated course summary endpoint prevents selector contents from depending on the truncated queue. `list_uploads` first calls `expire_stale_uploads`, marking active records older than 15 minutes as `WORKER_ERROR` failures and preserving the three-attempt retry cap.
-- While any displayed job is active, a 2.5-second browser interval calls `GET /status/{task_id}` for each active task.
+- While any displayed job is active, a 2.5-second browser interval calls `GET /status/{task_id}` for each active task. When a task becomes terminal, the dashboard refreshes course summaries; a newly uploaded course is automatically selected when it becomes READY. A fresh dashboard session defaults to the most recently updated READY course.
 - Retry calls `POST /uploads/{upload_id}/retry`. The service takes a PostgreSQL `FOR UPDATE` row lock and admits only `FAILED`, retryable records below three attempts. It updates the same document, creates a new `ProcessingAttempt`, and publishes a new task ID.
 - Preview looks up the document row and streams the stored local PDF through `FileResponse`.
 - Deletion permits only a failed database record, deletes it and cascaded attempts, then unlinks the PDF. It does not call Qdrant/Neo4j cleanup at deletion time; the worker is expected to have cleaned partial data.
@@ -271,7 +271,7 @@ Unlike query retrieval, exam retrieval performs no semantic search. It scrolls e
 | `src/main.tsx` | React root with `StrictMode`. |
 | `src/App.tsx` | Tiny History API router for `/` and `/dashboard`; lazy routes; fixed navigation; application error boundary. There is no React Router dependency. |
 | `src/pages/Home.tsx` | Landing-page composition using the animated hero and MacBook visualization. |
-| `src/pages/Dashboard.tsx` | Main state/orchestration component: immutable-ID course selection from course summaries, per-course and queue metrics, queue filters/polling/actions, answer/citations, graph transformation, PDF preview. |
+| `src/pages/Dashboard.tsx` | Main state/orchestration component: immutable-ID course selection from course summaries, pending-upload selection handoff, per-course and queue metrics, queue filters/polling/actions, answer/citations, graph transformation, PDF preview. Course changes clear stale answer and graph state. |
 | `src/services/api.ts` | Typed frontend API contracts and `fetchWithTimeout`; defaults to `http://localhost:8000/api/v1`; parses FastAPI `detail`; query/exam timeout 60 s. |
 | `src/components/UploadModal.tsx` | Client PDF/course validation, drag/drop, upload request, success/error state. |
 | `src/components/ExamPanel.tsx` | Fixed five-question generation and reveal/hide answer state. |
@@ -435,6 +435,8 @@ erDiagram
 Concept ID format is `{course_uuid}:{upload_id}:{llm_concept_id}`. This intentionally prevents nodes from separate documents from being merged, even if they describe the same concept. Consequently, “same concept across documents” is duplicated rather than reconciled.
 
 `(:Course)-[:CONTAINS]->(:Concept)` establishes course membership. Concept-to-concept relationship type is dynamically sanitized from LLM output. Relationship properties: original `relation_type`, `course_id`, `upload_id`, `document_name`. Supported labels are not constrained to a fixed enum; the prompt suggests `PREREQUISITE_OF`, `PART_OF`, `EXPLAINS`, or `RELATED_TO`.
+
+Graph retrieval iterates native Neo4j `Record` values rather than calling `Result.data()`. In the installed driver, `data()` converts relationships into lossy tuples and removes the endpoint properties needed by `_relationship_to_dict`; preserving native records avoids the retrieval failure and retains type, direction, and provenance.
 
 ### Writes
 
@@ -903,7 +905,7 @@ These answers defend the implementation honestly. A strong interview answer shou
 
 74. **What polling issue appears at scale?** One request per active job per tick creates browser/API fan-out. SSE or one batch status endpoint scales better.
 
-75. **How are courses selected?** `GET /api/v1/ingest/courses` returns canonical IDs, readable names, readiness, and aggregates. The selector submits the immutable ID, auto-selects the first READY course, and disables courses with zero READY documents.
+75. **How are courses selected?** `GET /api/v1/ingest/courses` returns canonical IDs, readable names, readiness, and aggregates. The selector submits the immutable ID, defaults to the most recently updated READY course, and disables courses with zero READY documents. The dashboard retains a pending course ID after upload, refreshes summaries on the READY transition, then selects it automatically.
 
 76. **Why is the course selector independent of queue history?** Course summaries load canonical courses separately from document rows, collapse same-hash history in the service, and return every course independently of queue grouping or truncation.
 

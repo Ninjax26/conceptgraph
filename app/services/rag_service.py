@@ -87,7 +87,9 @@ class RetrievalService:
 
         async with self.graph_driver.session() as session:
             result = await session.run(cypher, parameters)
-            records = await result.data()
+            # `Result.data()` converts relationships into lossy tuples. Keep
+            # native Record values so relationship endpoints and properties survive.
+            records = [record async for record in result]
 
             if not records:
                 records = await self._fetch_course_graph(
@@ -172,7 +174,7 @@ class RetrievalService:
         prerequisite_names: list[str],
         document_ids: list[str],
         top_k: int = 10,
-    ) -> list[dict[str, Any]]:
+    ) -> list[Any]:
         if not self._collection_exists():
             logger.info("Qdrant collection %s does not exist yet.", self.collection_name)
             return []
@@ -370,8 +372,9 @@ class RetrievalService:
 
     @staticmethod
     def _relationship_to_dict(relationship: Any) -> dict[str, Any]:
+        properties = dict(relationship.items())
         return {
-            **dict(relationship),
+            **properties,
             "type": relationship.type,
             "source": relationship.start_node.get("id"),
             "target": relationship.end_node.get("id"),
@@ -406,7 +409,7 @@ class RetrievalService:
             course_ids=course_ids,
             document_ids=document_ids,
         )
-        return await result.data()
+        return [record async for record in result]
 
     async def _fetch_graph_totals(
         self, session, course_ids: list[str], document_ids: list[str]

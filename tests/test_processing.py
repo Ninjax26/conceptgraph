@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 from app.core.processing import FailureCategory, classify_failure, normalize_course_name
 from app.services.citation_service import build_sources
 from app.services.course_service import CourseNotReadyError, CourseService
+from app.services.rag_service import RetrievalService
 from app.schemas.extraction import ConceptNode, ConceptRelationship, GraphExtractionResponse
 from pydantic import ValidationError
 
@@ -72,6 +73,25 @@ class ProcessingRulesTests(unittest.TestCase):
             relationships=[relationship, relationship],
         )
         self.assertEqual(len(graph.relationships), 1)
+
+    def test_neo4j_relationship_uses_mapping_interface(self):
+        class FakeRelationship:
+            type = "PREREQUISITE_OF"
+            start_node = {"id": "source"}
+            end_node = {"id": "target"}
+
+            def items(self):
+                return [("document_name", "Course.pdf")]
+
+            def __iter__(self):
+                return iter(["not-a-key-value-pair"])
+
+        serialized = RetrievalService._relationship_to_dict(FakeRelationship())
+
+        self.assertEqual(serialized["type"], "PREREQUISITE_OF")
+        self.assertEqual(serialized["source"], "source")
+        self.assertEqual(serialized["target"], "target")
+        self.assertEqual(serialized["document_name"], "Course.pdf")
 
 
 class ReadyContextTests(unittest.TestCase):

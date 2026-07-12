@@ -55,6 +55,7 @@ export default function Dashboard(): JSX.Element {
   const [isUploadModalOpen, setIsUploadModalOpen] = useState(false);
   const [uploadJobs, setUploadJobs] = useState<UploadJob[]>([]);
   const [courses, setCourses] = useState<CourseSummary[]>([]);
+  const [pendingCourseSelection, setPendingCourseSelection] = useState<string | null>(null);
   const [showAllUploads, setShowAllUploads] = useState(false);
   const [retryingUploadId, setRetryingUploadId] = useState<string | null>(null);
   const [answerCopied, setAnswerCopied] = useState(false);
@@ -68,7 +69,10 @@ export default function Dashboard(): JSX.Element {
     () => buildGraphElements(response?.graph_context ?? []),
     [response],
   );
-  const canSubmitQuery = question.trim().length > 0 && courseId.trim().length > 0;
+  const selectedCourse = courses.find((course) => course.course_id === courseId);
+  const canSubmitQuery =
+    question.trim().length > 0 &&
+    Boolean(selectedCourse && selectedCourse.ready_documents > 0);
   const filteredUploads = uploadJobs
     .filter((job) => queueFilter === "all" || job.status === queueFilter)
     .sort((left, right) => {
@@ -76,7 +80,6 @@ export default function Dashboard(): JSX.Element {
       return rank[left.status] - rank[right.status] || Date.parse(right.updated_at) - Date.parse(left.updated_at);
     });
   const visibleUploads = showAllUploads ? filteredUploads : filteredUploads.slice(0, 4);
-  const selectedCourse = courses.find((course) => course.course_id === courseId);
   const queueMetrics = uploadJobs.reduce(
     (totals, job) => ({
       active: totals.active + Number(job.status === "active"),
@@ -100,14 +103,26 @@ export default function Dashboard(): JSX.Element {
     }
   }
 
+  function selectCourse(nextCourseId: string): void {
+    setCourseId(nextCourseId);
+    setResponse(null);
+    setError(null);
+  }
+
   useEffect(() => {
     void refreshUploads();
   }, []);
 
   useEffect(() => {
     if (!courseId || !courses.some((course) => course.course_id === courseId)) {
-      const readyCourse = courses.find((course) => course.ready_documents > 0);
-      if (readyCourse) setCourseId(readyCourse.course_id);
+      const readyCourse = [...courses]
+        .filter((course) => course.ready_documents > 0)
+        .sort(
+          (left, right) =>
+            Date.parse(right.last_updated_at ?? "") -
+            Date.parse(left.last_updated_at ?? ""),
+        )[0];
+      if (readyCourse) selectCourse(readyCourse.course_id);
     }
   }, [courseId, courses]);
 
@@ -122,6 +137,12 @@ export default function Dashboard(): JSX.Element {
     const intervalId = window.setInterval(async () => {
       const results = await Promise.allSettled(
         pending.map(async (job) => getUploadStatus(job.task_id)),
+      );
+
+      const terminalUpdates = results.flatMap((result) =>
+        result.status === "fulfilled" && result.value.status !== "active"
+          ? [result.value]
+          : [],
       );
 
       setUploadJobs((current) =>
@@ -154,10 +175,43 @@ export default function Dashboard(): JSX.Element {
           };
         }),
       );
+
+      if (terminalUpdates.length > 0) {
+        try {
+          const nextCourses = await listCourses();
+          setCourses(nextCourses);
+          const preferredReadyCourse = pendingCourseSelection
+            ? nextCourses.find(
+                (course) =>
+                  course.course_id === pendingCourseSelection &&
+                  course.ready_documents > 0,
+              )
+            : undefined;
+          if (preferredReadyCourse) {
+            selectCourse(preferredReadyCourse.course_id);
+            setPendingCourseSelection(null);
+          } else if (
+            pendingCourseSelection &&
+            terminalUpdates.some(
+              (update) =>
+                update.course_id === pendingCourseSelection &&
+                update.status === "failed",
+            )
+          ) {
+            setPendingCourseSelection(null);
+          }
+        } catch (requestError) {
+          setError(
+            requestError instanceof Error
+              ? requestError.message
+              : "The document finished, but course selection could not be refreshed.",
+          );
+        }
+      }
     }, 2500);
 
     return () => window.clearInterval(intervalId);
-  }, [uploadJobs]);
+  }, [pendingCourseSelection, uploadJobs]);
 
   function handleUploadCreated(upload: IngestResponse): void {
     const now = new Date().toISOString();
@@ -187,6 +241,11 @@ export default function Dashboard(): JSX.Element {
       },
       ...current.filter((job) => job.upload_id !== upload.upload_id),
     ]);
+    setPendingCourseSelection(upload.course_id);
+    if (upload.status === "READY") {
+      selectCourse(upload.course_id);
+      setPendingCourseSelection(null);
+    }
     void refreshUploads();
   }
 
@@ -260,11 +319,11 @@ export default function Dashboard(): JSX.Element {
         <form className="border-b border-slate-200 p-4" onSubmit={handleSubmit}>
           <div className="space-y-3">
             <label className="block text-xs font-semibold uppercase tracking-wide text-slate-500">
-              Course ID
+              Course (all READY PDFs)
               <select
                 className="mt-1 h-10 w-full rounded-md border border-slate-300 px-3 text-sm font-medium text-ink outline-none transition focus:border-signal focus:ring-2 focus:ring-teal-100"
                 value={courseId}
-                onChange={(event) => setCourseId(event.target.value)}
+                onChange={(event) => selectCourse(event.target.value)}
                 disabled={courses.length === 0}
               >
                 {courses.length === 0 ? <option value="">Upload a course PDF to begin</option> : null}
@@ -279,6 +338,9 @@ export default function Dashboard(): JSX.Element {
                 ))}
               </select>
             </label>
+            <p className="text-xs text-slate-500">
+              A new upload is selected automatically when processing reaches READY.
+            </p>
             {selectedCourse ? (
               <div className="grid grid-cols-3 gap-2" aria-label="Selected course metrics">
                 <Metric label="Ready PDFs" value={selectedCourse.ready_documents} />
@@ -370,7 +432,7 @@ export default function Dashboard(): JSX.Element {
                       <button
                         className="text-xs text-slate-500 hover:text-teal-700 disabled:cursor-default disabled:hover:text-slate-500"
                         disabled={!courses.some((course) => course.course_id === job.course_id && course.ready_documents > 0)}
-                        onClick={() => setCourseId(job.course_id)}
+                        onClick={() => selectCourse(job.course_id)}
                         type="button"
                       >
                         Course {job.course_name}

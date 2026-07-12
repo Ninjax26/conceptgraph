@@ -172,6 +172,7 @@ Open the app at `http://127.0.0.1:5173`.
 - Graph nodes and relationships carry document provenance (`upload_id` and document name). Legacy graph data without provenance is excluded from query graph counts.
 - Failed attempts are retained in `processing_attempts`; retries update the original document and are capped at three attempts.
 - Course selection comes from `GET /api/v1/ingest/courses`, not the truncated processing queue. Courses without READY content remain visible but cannot be selected for query or exam generation.
+- The dashboard remembers the course associated with a new upload, refreshes course summaries when polling observes READY, and automatically selects that course. On a fresh page load it selects the most recently updated READY course. Changing courses clears the previous answer and concept map.
 
 | Stage | Input | Output / storage | Success condition | Failure condition |
 | --- | --- | --- | --- | --- |
@@ -210,6 +211,8 @@ Failure categories are `DOCUMENT_ERROR`, `CONFIGURATION_ERROR`, `PROVIDER_ERROR`
 Answers use readable citations such as `[Source 1]` and `[Source 2, p. 6]`. Internal chunk IDs, vector IDs, file paths, and scores are never included in model prompts or displayed answers. Source cards include the PDF name, page, detected section heading, and supporting passage.
 
 Only `PREREQUISITE_OF` relationships expand the vector query and participate in the highlighted prerequisite path. Other relationship types remain visible with their real labels. Graph extraction rejects duplicate entity IDs and missing relationship endpoints, and collapses identical edges before persistence.
+
+Neo4j retrieval preserves native records instead of using the driver's lossy `Result.data()` conversion, then serializes nodes and relationships through their mapping interfaces. This retains relationship endpoints, types, and provenance for the frontend.
 
 ### Exam Generation
 
