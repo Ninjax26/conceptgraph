@@ -12,10 +12,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 
 from app.core.database import get_postgres_session
-from app.schemas.ingest import IngestResponse, UploadStatusResponse
+from app.schemas.ingest import CourseSummaryResponse, IngestResponse, UploadStatusResponse
 from app.services.upload_service import UploadService
 from app.services.course_service import CourseService
 from app.core.processing import normalize_course_name
+from app.core.processing import FailureCategory
 from app.tasks.document_tasks import process_pdf_task
 
 router = APIRouter(prefix="/api/v1/ingest", tags=["ingest"])
@@ -103,10 +104,23 @@ async def upload_document(
             stored_file_path.unlink(missing_ok=True)
         raise HTTPException(status_code=503, detail="Document tracking is temporarily unavailable.") from exc
 
-    task = process_pdf_task.apply_async(
-        args=[upload_id, str(stored_file_path), course.id, course.display_name, file.filename],
-        task_id=task_id,
-    )
+    try:
+        task = process_pdf_task.apply_async(
+            args=[upload_id, str(stored_file_path), course.id, course.display_name, file.filename],
+            task_id=task_id,
+        )
+    except Exception as exc:
+        await upload_service.mark_failed(
+            db,
+            upload_id,
+            "The processing worker is unavailable. Please retry when the service is restored.",
+            FailureCategory.WORKER_ERROR,
+            True,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="The processing worker is unavailable. The upload was saved and can be retried.",
+        ) from exc
 
     return IngestResponse(
         message="Background processing has started.",
@@ -196,6 +210,30 @@ async def list_uploads(
     ]
 
 
+@router.get("/courses", response_model=list[CourseSummaryResponse])
+async def list_courses(
+    db: AsyncSession = Depends(get_postgres_session),
+) -> list[CourseSummaryResponse]:
+    summaries = await course_service.list_summaries(db)
+    return [
+        CourseSummaryResponse(
+            course_id=summary.course.id,
+            course_name=summary.course.display_name,
+            total_documents=summary.total_documents,
+            active_documents=summary.active_documents,
+            ready_documents=summary.ready_documents,
+            failed_documents=summary.failed_documents,
+            processed_chunk_count=summary.processed_chunk_count,
+            graph_node_count=summary.graph_node_count,
+            graph_edge_count=summary.graph_edge_count,
+            last_updated_at=summary.last_updated_at,
+            historical_records=summary.historical_records,
+            duplicate_records=summary.duplicate_records,
+        )
+        for summary in summaries
+    ]
+
+
 @router.post("/uploads/{upload_id}/retry", response_model=IngestResponse)
 async def retry_upload(
     upload_id: str,
@@ -214,7 +252,13 @@ async def retry_upload(
 
     pdf_path = Path(record.stored_file_path)
     if not pdf_path.exists():
-        await upload_service.mark_failed(db, upload_id, "The stored PDF is no longer available.")
+        await upload_service.mark_failed(
+            db,
+            upload_id,
+            "The stored PDF is no longer available. Upload the document again.",
+            FailureCategory.DOCUMENT_ERROR,
+            False,
+        )
         raise HTTPException(status_code=404, detail="The stored PDF is no longer available.")
 
     task = process_pdf_task.apply_async(

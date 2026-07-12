@@ -102,7 +102,7 @@ class UploadService:
                 status="failed",
                 stage=ProcessingStage.FAILED.value,
                 failure_category=FailureCategory.WORKER_ERROR.value,
-                retryable=True,
+                retryable=DocumentUpload.attempt_count < MAX_PROCESSING_ATTEMPTS,
                 error_message="Processing was interrupted. Please retry this document.",
                 completed_at=datetime.now(timezone.utc),
             )
@@ -173,6 +173,8 @@ class UploadService:
         attempt = await self._current_attempt(session, record)
         if attempt is not None:
             attempt.stage = stage.value
+            if attempt.started_at is None:
+                attempt.started_at = record.started_at
         await session.commit()
 
     async def mark_completed(

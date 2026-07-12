@@ -16,6 +16,7 @@ ConceptGraph is an AI-powered academic knowledge graph and GraphRAG pipeline for
 - Tracks PDF ingestion status in real time through Celery-backed upload records.
 - Opens source citations with page-aware PDF previews in the dashboard.
 - Renders an interactive concept map in the React dashboard.
+- Shows canonical course choices plus logical document, chunk, and extracted graph metrics.
 
 ## Architecture
 
@@ -47,11 +48,12 @@ flowchart TD
 
 ## Core Features
 
-- Multi-tenant course scoping to prevent syllabus bleed across uploads.
+- Course scoping to prevent syllabus bleed across uploads. Authentication and true tenant ownership are not implemented.
 - Hybrid GraphRAG retrieval that expands user queries with prerequisite concepts.
 - Defensive error handling with explicit HTTP responses for missing config or empty data.
 - Simple course-level isolation across ingestion, retrieval, and exam generation.
 - Apple Silicon-friendly local execution with `arm64` container images and MPS-accelerated embeddings where available.
+- Graph-integrity validation for unique entities, valid relationship endpoints, and duplicate-edge removal.
 
 ## Tech Stack
 
@@ -165,9 +167,11 @@ Open the app at `http://127.0.0.1:5173`.
 
 - Courses have an immutable UUID plus a normalized, case-insensitive display name. `CYBER`, `Cyber`, and `cyber ` resolve to the same course.
 - PDFs are SHA-256 hashed before a document row is created. Uploading the same file to the same course returns the existing document instead of duplicating vectors or graph nodes.
+- Historical same-hash rows from installations predating duplicate detection are collapsed into one logical document for course metrics and READY retrieval; the history is retained rather than deleted.
 - Query and exam generation call the same READY-course resolver and filter Qdrant by READY document IDs.
 - Graph nodes and relationships carry document provenance (`upload_id` and document name). Legacy graph data without provenance is excluded from query graph counts.
 - Failed attempts are retained in `processing_attempts`; retries update the original document and are capped at three attempts.
+- Course selection comes from `GET /api/v1/ingest/courses`, not the truncated processing queue. Courses without READY content remain visible but cannot be selected for query or exam generation.
 
 | Stage | Input | Output / storage | Success condition | Failure condition |
 | --- | --- | --- | --- | --- |
@@ -187,7 +191,7 @@ Documents progress through durable stages:
 
 ```text
 UPLOADED -> EXTRACTING -> EXTRACTED -> CHUNKING -> CHUNKED
--> BUILDING_GRAPH -> GRAPH_BUILT -> EMBEDDING -> EMBEDDED -> READY
+-> EMBEDDING -> EMBEDDED -> BUILDING_GRAPH -> GRAPH_BUILT -> READY
 ```
 
 Terminal states are `READY`, `FAILED`, and `CANCELLED`. A document becomes `READY` only after text extraction, chunk creation, graph construction, vector storage, and database count updates succeed. A failed attempt compensates by deleting partial vectors and provenance-scoped graph nodes.
@@ -197,13 +201,15 @@ Failure categories are `DOCUMENT_ERROR`, `CONFIGURATION_ERROR`, `PROVIDER_ERROR`
 ### Retrieval
 
 1. The user asks a question.
-2. FastAPI asks the LLM for a safe read-only Cypher query.
-3. Neo4j returns the matching concept plus prerequisites.
+2. FastAPI runs a deterministic, parameterized, read-only Cypher query scoped to READY documents.
+3. Neo4j returns matching concepts and typed incoming relationships.
 4. Those prerequisite names expand the vector query sent to Qdrant.
 5. A local cross-encoder reranks the chunks.
 6. The synthesis model answers strictly from the provided context.
 
 Answers use readable citations such as `[Source 1]` and `[Source 2, p. 6]`. Internal chunk IDs, vector IDs, file paths, and scores are never included in model prompts or displayed answers. Source cards include the PDF name, page, detected section heading, and supporting passage.
+
+Only `PREREQUISITE_OF` relationships expand the vector query and participate in the highlighted prerequisite path. Other relationship types remain visible with their real labels. Graph extraction rejects duplicate entity IDs and missing relationship endpoints, and collapses identical edges before persistence.
 
 ### Exam Generation
 
@@ -215,6 +221,8 @@ Answers use readable citations such as `[Source 1]` and `[Source 2, p. 6]`. Inte
 
 - `POST /api/v1/ingest/upload`
 - `GET /api/v1/ingest/status/{task_id}`
+- `GET /api/v1/ingest/uploads`
+- `GET /api/v1/ingest/courses`
 - `GET /api/v1/ingest/uploads/{upload_id}/preview`
 - `POST /api/v1/ingest/uploads/{upload_id}/retry`
 - `DELETE /api/v1/ingest/uploads/{upload_id}` (failed records only)
@@ -242,6 +250,8 @@ The query response also includes graph count metadata:
 
 These values are illustrative response fields, not hardcoded dashboard statistics; the API calculates them from the selected READY documents.
 
+Dashboard course metrics distinguish the concepts and relationships recorded during extraction from the query-specific graph currently displayed. Historical duplicate records are shown as excluded history instead of inflating READY documents and chunk totals.
+
 ## Database Migration
 
 Startup performs an idempotent migration for existing local installations:
@@ -252,7 +262,20 @@ Startup performs an idempotent migration for existing local installations:
 - Converts interrupted legacy `queued`/`running` rows to retryable `WORKER_ERROR` failures.
 - Computes hashes for legacy PDFs that are still present on disk.
 
-The migration is additive and does not delete existing PDFs. Old Neo4j nodes without document provenance are intentionally excluded from new graph totals and should be rebuilt through explicit document reprocessing rather than silently attributed to a document.
+The migration is additive and does not delete existing PDFs. Old Neo4j nodes without document provenance are intentionally excluded from new graph totals. They must be rebuilt from a canonical PDF rather than silently attributed to a document, because doing so would invent provenance.
+
+## Graph Display Semantics
+
+- **READY PDFs**: unique SHA-256 document contents that completed every mandatory processing stage.
+- **Chunks**: page-aware searchable passages stored as Qdrant points. They overlap slightly to preserve context.
+- **Extracted nodes / edges**: concepts and relationships returned by graph extraction when the canonical document completed. These are processing-time counts, not a live Neo4j recount.
+- **Showing X of Y**: the query-specific Cytoscape subgraph compared with the provenance-scoped READY graph stored in Neo4j.
+
+Cytoscape deduplicates edges by source, target, and relationship type. It drops an edge when either endpoint is absent and highlights only incoming `PREREQUISITE_OF` chains. Isolated concepts can still be shown when independently relevant to the query.
+
+### Legacy graph note
+
+The current local CYBER dataset contains five historical PostgreSQL rows with one identical SHA-256 hash, so the dashboard correctly reports one logical READY PDF and excludes four duplicate records. Its older Neo4j concepts lack `upload_id` provenance and are therefore excluded from safe READY-document graph retrieval until the canonical PDF is reprocessed.
 
 ## Tests
 
@@ -262,6 +285,8 @@ Run backend rules and frontend production checks with:
 .venv/bin/python -m unittest discover -s tests -v
 npm run build
 ```
+
+The backend tests cover course normalization and logical duplicate summaries, failure retryability, READY gating, citation deduplication, missing graph endpoints, and duplicate relationships.
 
 ## Notes
 

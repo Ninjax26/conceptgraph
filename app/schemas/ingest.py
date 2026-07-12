@@ -42,3 +42,18 @@ class UploadStatusResponse(BaseModel):
     started_at: datetime | None = None
     completed_at: datetime | None = None
     preview_url: str = Field(default="")
+
+
+class CourseSummaryResponse(BaseModel):
+    course_id: str
+    course_name: str
+    total_documents: int = 0
+    active_documents: int = 0
+    ready_documents: int = 0
+    failed_documents: int = 0
+    processed_chunk_count: int = 0
+    graph_node_count: int = 0
+    graph_edge_count: int = 0
+    last_updated_at: datetime | None = None
+    historical_records: int = 0
+    duplicate_records: int = 0

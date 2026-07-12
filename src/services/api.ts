@@ -194,6 +194,21 @@ export interface UploadStatusResponse {
   preview_url: string;
 }
 
+export interface CourseSummary {
+  course_id: string;
+  course_name: string;
+  total_documents: number;
+  active_documents: number;
+  ready_documents: number;
+  failed_documents: number;
+  processed_chunk_count: number;
+  graph_node_count: number;
+  graph_edge_count: number;
+  last_updated_at?: string | null;
+  historical_records: number;
+  duplicate_records: number;
+}
+
 export async function getUploadStatus(taskId: string): Promise<UploadStatusResponse> {
   const response = await fetchWithTimeout(`${API_BASE_URL}/ingest/status/${taskId}`, {
     method: "GET",
@@ -210,6 +225,14 @@ export async function listUploads(): Promise<UploadStatusResponse[]> {
   });
 
   return response.json() as Promise<UploadStatusResponse[]>;
+}
+
+export async function listCourses(): Promise<CourseSummary[]> {
+  const response = await fetchWithTimeout(`${API_BASE_URL}/ingest/courses`, {
+    method: "GET",
+    timeout: 15000,
+  });
+  return response.json() as Promise<CourseSummary[]>;
 }
 
 export async function retryUpload(uploadId: string): Promise<IngestResponse> {

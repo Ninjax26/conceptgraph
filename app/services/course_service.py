@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from datetime import datetime
 from uuid import NAMESPACE_URL, uuid5
 
 from sqlalchemy import select
@@ -32,7 +33,59 @@ class ReadyCourseContext:
         return sorted(aliases)
 
 
+@dataclass(frozen=True, slots=True)
+class CourseSummary:
+    course: Course
+    total_documents: int
+    active_documents: int
+    ready_documents: int
+    failed_documents: int
+    processed_chunk_count: int
+    graph_node_count: int
+    graph_edge_count: int
+    last_updated_at: datetime | None
+    historical_records: int
+    duplicate_records: int
+
+
 class CourseService:
+    async def list_summaries(self, session: AsyncSession) -> list[CourseSummary]:
+        courses = list((await session.execute(select(Course).order_by(Course.display_name))).scalars())
+        documents = list(
+            (
+                await session.execute(
+                    select(DocumentUpload).order_by(DocumentUpload.updated_at.desc())
+                )
+            ).scalars()
+        )
+        summaries: list[CourseSummary] = []
+        status_rank = {"ready": 0, "active": 1, "failed": 2, "cancelled": 3}
+        for course in courses:
+            records = [document for document in documents if document.course_uuid == course.id]
+            canonical: dict[str, DocumentUpload] = {}
+            for document in sorted(
+                records,
+                key=lambda item: (status_rank.get(item.status, 9), -item.updated_at.timestamp()),
+            ):
+                canonical.setdefault(document.content_hash or document.upload_id, document)
+            logical_documents = list(canonical.values())
+            summaries.append(
+                CourseSummary(
+                    course=course,
+                    total_documents=len(logical_documents),
+                    active_documents=sum(document.status == "active" for document in logical_documents),
+                    ready_documents=sum(document.status == "ready" for document in logical_documents),
+                    failed_documents=sum(document.status == "failed" for document in logical_documents),
+                    processed_chunk_count=sum(document.processed_chunk_count for document in logical_documents),
+                    graph_node_count=sum(document.graph_node_count for document in logical_documents),
+                    graph_edge_count=sum(document.graph_edge_count for document in logical_documents),
+                    last_updated_at=max((document.updated_at for document in records), default=None),
+                    historical_records=len(records),
+                    duplicate_records=len(records) - len(logical_documents),
+                )
+            )
+        return summaries
+
     async def get_or_create(self, session: AsyncSession, name: str) -> Course:
         normalized = normalize_course_name(name)
         if not normalized:
@@ -83,7 +136,10 @@ class CourseService:
             )
             .order_by(DocumentUpload.created_at.desc())
         )
-        documents = tuple(result.scalars().all())
+        unique_documents: dict[str, DocumentUpload] = {}
+        for document in result.scalars().all():
+            unique_documents.setdefault(document.content_hash or document.upload_id, document)
+        documents = tuple(unique_documents.values())
         if not documents:
             raise CourseNotReadyError(
                 "This course has no ready documents. Finish processing a PDF before continuing."

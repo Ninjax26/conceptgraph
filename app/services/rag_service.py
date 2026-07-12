@@ -100,6 +100,7 @@ class RetrievalService:
 
         concepts: list[dict[str, Any]] = []
         prerequisite_names: list[str] = []
+        displayed_edge_ids: set[tuple[str, str, str]] = set()
         for record in records:
             concept = self._node_to_dict(record.get("concept"))
             prerequisites = [
@@ -107,20 +108,32 @@ class RetrievalService:
                 for node in record.get("prerequisites", [])
                 if node is not None
             ]
+            relationships = [
+                self._relationship_to_dict(rel)
+                for rel in record.get("relationships", [])
+                if rel is not None
+            ]
             concepts.append({
                 "concept": concept,
                 "prerequisites": prerequisites,
-                "relationships": [
-                    self._relationship_to_dict(rel)
-                    for rel in record.get("relationships", [])
-                    if rel is not None
-                ],
+                "relationships": relationships,
             })
-            prerequisite_names.extend(
-                str(node["name"])
+            names_by_id = {
+                str(node.get("id")): str(node.get("name"))
                 for node in prerequisites
-                if node.get("name")
-            )
+                if node.get("id") and node.get("name")
+            }
+            for relationship in relationships:
+                edge_id = (
+                    str(relationship.get("source", "")),
+                    str(relationship.get("target", "")),
+                    str(relationship.get("type", "")),
+                )
+                displayed_edge_ids.add(edge_id)
+                if relationship.get("type") == "PREREQUISITE_OF":
+                    prerequisite_name = names_by_id.get(str(relationship.get("source", "")))
+                    if prerequisite_name:
+                        prerequisite_names.append(prerequisite_name)
 
         return GraphRetrievalResult(
             concepts=concepts,
@@ -134,7 +147,7 @@ class RetrievalService:
                     for node in [item["concept"], *item["prerequisites"]]
                     if node.get("id")
                 }),
-                "displayed_edges": sum(len(item["relationships"]) for item in concepts),
+                "displayed_edges": len(displayed_edge_ids),
                 "filter_reason": "query_subgraph",
             },
         )
@@ -403,7 +416,9 @@ class RetrievalService:
             MATCH (course:Course)-[:CONTAINS]->(concept:Concept)
             WHERE course.id IN $course_ids
               AND concept.upload_id IN $document_ids
-            OPTIONAL MATCH (concept)-[relationship]->(:Concept)
+            OPTIONAL MATCH (concept)-[relationship]->(target:Concept)
+            WHERE target.upload_id IN $document_ids
+              AND (course)-[:CONTAINS]->(target)
             RETURN count(DISTINCT concept) AS total_nodes,
                    count(DISTINCT relationship) AS total_edges
             """,

@@ -144,7 +144,9 @@ export default function ConceptGraphCanvas({
         current.removeClass("dimmed").addClass("selectedPath");
 
         for (let step = 0; step < maxSteps && current; step++) {
-          const inEdges = current.incomers("edge");
+          const inEdges = current.incomers("edge").filter(
+            (edge) => edge.data("label") === "PREREQUISITE_OF",
+          );
           if (inEdges.length === 0) break;
 
           // Prefer an edge that leads to an unvisited prerequisite node

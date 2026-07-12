@@ -21,18 +21,19 @@ import PdfPreviewModal from "../components/PdfPreviewModal";
 import UploadModal from "../components/UploadModal";
 import {
   API_BASE_URL,
+  CourseSummary,
   GraphContextItem,
   IngestResponse,
   QueryResponse,
   UploadStatusResponse,
   getUploadStatus,
+  listCourses,
   listUploads,
   retryUpload,
   removeFailedUpload,
   sendQuery,
 } from "../services/api";
 
-const DEFAULT_COURSE_ID = "default-course";
 const ConceptGraphCanvas = lazy(() => import("../components/ConceptGraphCanvas"));
 const ExamPanel = lazy(() => import("../components/ExamPanel"));
 const QUESTION_STARTERS = [
@@ -47,12 +48,13 @@ type UploadJob = UploadStatusResponse & {
 
 export default function Dashboard(): JSX.Element {
   const [question, setQuestion] = useState("");
-  const [courseId, setCourseId] = useState(DEFAULT_COURSE_ID);
+  const [courseId, setCourseId] = useState("");
   const [response, setResponse] = useState<QueryResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [isUploadModalOpen, setIsUploadModalOpen] = useState(false);
   const [uploadJobs, setUploadJobs] = useState<UploadJob[]>([]);
+  const [courses, setCourses] = useState<CourseSummary[]>([]);
   const [showAllUploads, setShowAllUploads] = useState(false);
   const [retryingUploadId, setRetryingUploadId] = useState<string | null>(null);
   const [answerCopied, setAnswerCopied] = useState(false);
@@ -74,11 +76,21 @@ export default function Dashboard(): JSX.Element {
       return rank[left.status] - rank[right.status] || Date.parse(right.updated_at) - Date.parse(left.updated_at);
     });
   const visibleUploads = showAllUploads ? filteredUploads : filteredUploads.slice(0, 4);
-  const courseIds = Array.from(new Set(uploadJobs.map((job) => job.course_name)));
+  const selectedCourse = courses.find((course) => course.course_id === courseId);
+  const queueMetrics = uploadJobs.reduce(
+    (totals, job) => ({
+      active: totals.active + Number(job.status === "active"),
+      ready: totals.ready + Number(job.status === "ready"),
+      failed: totals.failed + Number(job.status === "failed"),
+    }),
+    { active: 0, ready: 0, failed: 0 },
+  );
 
   async function refreshUploads(): Promise<void> {
     try {
-      setUploadJobs(await listUploads());
+      const [nextUploads, nextCourses] = await Promise.all([listUploads(), listCourses()]);
+      setUploadJobs(nextUploads);
+      setCourses(nextCourses);
     } catch (requestError) {
       setError(
         requestError instanceof Error
@@ -93,11 +105,11 @@ export default function Dashboard(): JSX.Element {
   }, []);
 
   useEffect(() => {
-    if (courseId === DEFAULT_COURSE_ID) {
-      const readyCourse = uploadJobs.find((job) => job.status === "ready")?.course_name;
-      if (readyCourse) setCourseId(readyCourse);
+    if (!courseId || !courses.some((course) => course.course_id === courseId)) {
+      const readyCourse = courses.find((course) => course.ready_documents > 0);
+      if (readyCourse) setCourseId(readyCourse.course_id);
     }
-  }, [courseId, uploadJobs]);
+  }, [courseId, courses]);
 
   useEffect(() => {
     const pending = uploadJobs.filter(
@@ -173,8 +185,9 @@ export default function Dashboard(): JSX.Element {
         completed_at: null,
         preview_url: upload.preview_url,
       },
-      ...current.filter((job) => job.task_id !== upload.task_id),
+      ...current.filter((job) => job.upload_id !== upload.upload_id),
     ]);
+    void refreshUploads();
   }
 
   async function handleRetry(job: UploadJob): Promise<void> {
@@ -252,11 +265,32 @@ export default function Dashboard(): JSX.Element {
                 className="mt-1 h-10 w-full rounded-md border border-slate-300 px-3 text-sm font-medium text-ink outline-none transition focus:border-signal focus:ring-2 focus:ring-teal-100"
                 value={courseId}
                 onChange={(event) => setCourseId(event.target.value)}
+                disabled={courses.length === 0}
               >
-                {!courseIds.includes(courseId) ? <option value={courseId}>{courseId}</option> : null}
-                {courseIds.map((id) => <option key={id} value={id} />)}
+                {courses.length === 0 ? <option value="">Upload a course PDF to begin</option> : null}
+                {courses.map((course) => (
+                  <option
+                    disabled={course.ready_documents === 0}
+                    key={course.course_id}
+                    value={course.course_id}
+                  >
+                    {course.course_name} · {course.ready_documents} ready · {course.processed_chunk_count} chunks
+                  </option>
+                ))}
               </select>
             </label>
+            {selectedCourse ? (
+              <div className="grid grid-cols-3 gap-2" aria-label="Selected course metrics">
+                <Metric label="Ready PDFs" value={selectedCourse.ready_documents} />
+                <Metric label="Chunks" value={selectedCourse.processed_chunk_count} />
+                <Metric label="Extracted nodes / edges" value={`${selectedCourse.graph_node_count} / ${selectedCourse.graph_edge_count}`} />
+              </div>
+            ) : null}
+            {selectedCourse?.duplicate_records ? (
+              <p className="text-xs text-amber-700">
+                {selectedCourse.duplicate_records} historical duplicate records are excluded from these course totals.
+              </p>
+            ) : null}
             <label className="block text-xs font-semibold uppercase tracking-wide text-slate-500">
               Student Question
               <textarea
@@ -294,7 +328,7 @@ export default function Dashboard(): JSX.Element {
         </form>
 
         <Suspense fallback={<div className="border-b border-slate-200 p-4 text-xs text-slate-500">Loading practice tools...</div>}>
-          <ExamPanel courseId={courseId.trim()} />
+          <ExamPanel courseId={courseId} />
         </Suspense>
 
         <div className="border-b border-slate-200 p-4">
@@ -303,7 +337,7 @@ export default function Dashboard(): JSX.Element {
               Processing Queue
             </h2>
             <div className="flex items-center gap-2">
-              <span className="text-xs text-slate-400">{filteredUploads.length} documents</span>
+              <span className="text-xs text-slate-400">{uploadJobs.length} documents</span>
               <button
                 aria-label="Refresh uploads"
                 className="rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700"
@@ -317,7 +351,7 @@ export default function Dashboard(): JSX.Element {
           <div className="mb-3 flex gap-1 rounded-md bg-slate-100 p-1">
             {(["active", "ready", "failed", "all"] as const).map((filter) => (
               <button className={`flex-1 rounded px-2 py-1 text-[10px] font-semibold uppercase tracking-wide ${queueFilter === filter ? "bg-white text-ink shadow-sm" : "text-slate-500"}`} key={filter} onClick={() => setQueueFilter(filter)} type="button">
-                {filter}
+                {filter} {filter === "all" ? uploadJobs.length : queueMetrics[filter]}
               </button>
             ))}
           </div>
@@ -334,8 +368,9 @@ export default function Dashboard(): JSX.Element {
                         {job.original_filename}
                       </p>
                       <button
-                        className="text-xs text-slate-500 hover:text-teal-700"
-                        onClick={() => setCourseId(job.course_name)}
+                        className="text-xs text-slate-500 hover:text-teal-700 disabled:cursor-default disabled:hover:text-slate-500"
+                        disabled={!courses.some((course) => course.course_id === job.course_id && course.ready_documents > 0)}
+                        onClick={() => setCourseId(job.course_id)}
                         type="button"
                       >
                         Course {job.course_name}
@@ -569,9 +604,9 @@ function buildGraphElements(graphContext: GraphContextItem[]): {
 
     });
 
-    item.relationships.forEach((relationship, relationshipIndex) => {
+    item.relationships.forEach((relationship) => {
       if (!nodes.has(relationship.source) || !nodes.has(relationship.target)) return;
-      const edgeId = `${relationship.source}->${relationship.target}:${relationship.type}:${relationshipIndex}`;
+      const edgeId = `${relationship.source}->${relationship.target}:${relationship.type}`;
       edges.set(edgeId, {
         id: edgeId,
         source: relationship.source,
@@ -624,4 +659,13 @@ function friendlyUploadError(message: string | null | undefined): string {
     return "The AI provider was not configured when this upload ran. Retry it now.";
   }
   return message.length > 180 ? "Document processing failed. Please retry it or upload another PDF." : message;
+}
+
+function Metric({ label, value }: { label: string; value: string | number }): JSX.Element {
+  return (
+    <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2">
+      <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">{label}</p>
+      <p className="mt-0.5 text-sm font-semibold text-ink">{value}</p>
+    </div>
+  );
 }
