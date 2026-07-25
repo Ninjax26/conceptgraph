@@ -261,10 +261,29 @@ async def retry_upload(
         )
         raise HTTPException(status_code=404, detail="The stored PDF is no longer available.")
 
-    task = process_pdf_task.apply_async(
-        args=[record.upload_id, record.stored_file_path, record.course_uuid, record.course_id, record.original_filename],
-        task_id=task_id,
-    )
+    try:
+        task = process_pdf_task.apply_async(
+            args=[
+                record.upload_id,
+                record.stored_file_path,
+                record.course_uuid,
+                record.course_id,
+                record.original_filename,
+            ],
+            task_id=task_id,
+        )
+    except Exception as exc:
+        await upload_service.mark_failed(
+            db,
+            upload_id,
+            "The processing worker is unavailable. Please retry when the service is restored.",
+            FailureCategory.WORKER_ERROR,
+            True,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="The processing worker is unavailable. The retry was saved and can be attempted again.",
+        ) from exc
     return IngestResponse(
         message="Document processing has been queued again.",
         task_id=task.id,

@@ -1,9 +1,14 @@
 import asyncio
+import tempfile
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import ANY, AsyncMock, patch
 
+from fastapi import HTTPException
+
+from app.api.endpoints import ingest
 from app.core.processing import FailureCategory, classify_failure, normalize_course_name
 from app.services.citation_service import build_sources
 from app.services.course_service import CourseNotReadyError, CourseService
@@ -143,6 +148,51 @@ class ReadyContextTests(unittest.TestCase):
         self.assertEqual(summaries[0].ready_documents, 1)
         self.assertEqual(summaries[0].processed_chunk_count, 7)
         self.assertEqual(summaries[0].duplicate_records, 1)
+
+
+class RetryEndpointTests(unittest.TestCase):
+    def test_worker_enqueue_failure_returns_document_to_failed_state(self):
+        with tempfile.NamedTemporaryFile(suffix=".pdf") as source:
+            record = SimpleNamespace(
+                upload_id="upload-1",
+                task_id="old-task",
+                course_uuid="course-uuid",
+                course_id="CYBER",
+                original_filename="course.pdf",
+                stored_file_path=str(Path(source.name)),
+                stage="FAILED",
+                retryable=True,
+            )
+            retried_record = SimpleNamespace(**vars(record))
+            retried_record.task_id = "new-task"
+            retried_record.stage = "UPLOADED"
+            retried_record.retryable = False
+
+            with (
+                patch.object(ingest.upload_service, "get_upload", AsyncMock(return_value=record)),
+                patch.object(
+                    ingest.upload_service,
+                    "retry_upload",
+                    AsyncMock(return_value=retried_record),
+                ),
+                patch.object(ingest.upload_service, "mark_failed", AsyncMock()) as mark_failed,
+                patch.object(
+                    ingest.process_pdf_task,
+                    "apply_async",
+                    side_effect=ConnectionError("broker unavailable"),
+                ),
+            ):
+                with self.assertRaises(HTTPException) as raised:
+                    asyncio.run(ingest.retry_upload(record.upload_id, SimpleNamespace()))
+
+            self.assertEqual(raised.exception.status_code, 503)
+            mark_failed.assert_awaited_once_with(
+                ANY,
+                record.upload_id,
+                "The processing worker is unavailable. Please retry when the service is restored.",
+                FailureCategory.WORKER_ERROR,
+                True,
+            )
 
 
 if __name__ == "__main__":
