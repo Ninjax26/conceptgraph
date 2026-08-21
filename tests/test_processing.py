@@ -2,18 +2,24 @@ import asyncio
 import tempfile
 import unittest
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, patch
 
-from fastapi import HTTPException
+import fitz
+from botocore.exceptions import EndpointConnectionError
+from fastapi import HTTPException, UploadFile
+from starlette.datastructures import Headers
 
 from app.api.endpoints import ingest
+from app.core.config import Settings
 from app.core.processing import FailureCategory, ProcessingStage, classify_failure, normalize_course_name
 from app.services.citation_service import assess_evidence, build_sources
 from app.services.course_service import CourseNotReadyError, CourseService
 from app.services.exam_service import ExamService
 from app.services.rag_service import RetrievalService
+from app.services.storage_service import ObjectStorageError, StorageService
 from app.services.upload_service import UploadService
 from app.schemas.exam import ExamSource
 from app.schemas.extraction import ConceptNode, ConceptRelationship, GraphExtractionResponse
@@ -186,6 +192,178 @@ class ProcessingRulesTests(unittest.TestCase):
 
         self.assertEqual(ExamService._parse_questions(raw, [source]), [])
 
+    def test_render_postgres_url_uses_asyncpg_driver(self):
+        config = Settings(DATABASE_URL="postgresql://user:password@db/course")
+
+        self.assertEqual(
+            config.postgres_dsn,
+            "postgresql+asyncpg://user:password@db/course",
+        )
+
+    def test_pdf_preview_supports_byte_ranges(self):
+        response = ingest._pdf_response(b"0123456789", "Course Notes.pdf", "bytes=2-5")
+
+        self.assertEqual(response.status_code, 206)
+        self.assertEqual(response.body, b"2345")
+        self.assertEqual(response.headers["content-range"], "bytes 2-5/10")
+
+
+class StorageServiceTests(unittest.TestCase):
+    class FakeBody:
+        def __init__(self, content: bytes):
+            self.content = content
+            self.closed = False
+
+        def read(self):
+            return self.content
+
+        def close(self):
+            self.closed = True
+
+    class FakeS3:
+        def __init__(self):
+            self.objects: dict[tuple[str, str], bytes] = {}
+
+        def head_bucket(self, **kwargs):
+            return {}
+
+        def put_object(self, **kwargs):
+            self.objects[(kwargs["Bucket"], kwargs["Key"])] = kwargs["Body"]
+
+        def get_object(self, **kwargs):
+            return {
+                "Body": StorageServiceTests.FakeBody(
+                    self.objects[(kwargs["Bucket"], kwargs["Key"])]
+                )
+            }
+
+        def head_object(self, **kwargs):
+            self.objects[(kwargs["Bucket"], kwargs["Key"])]
+            return {}
+
+        def delete_object(self, **kwargs):
+            self.objects.pop((kwargs["Bucket"], kwargs["Key"]), None)
+
+    def test_s3_round_trip_uses_content_addressed_key(self):
+        client = self.FakeS3()
+        config = Settings(
+            OBJECT_STORAGE_BACKEND="s3",
+            S3_BUCKET="test-pdfs",
+            S3_ENDPOINT_URL="https://objects.example.test",
+            S3_AUTO_CREATE_BUCKET=False,
+        )
+        service = StorageService(config, client=client)
+        key = service.object_key("course-1", "abc123")
+
+        service.put_pdf(key, b"pdf-content")
+
+        self.assertEqual(key, "courses/course-1/documents/abc123.pdf")
+        self.assertTrue(service.exists(key))
+        self.assertEqual(service.get_bytes(key), b"pdf-content")
+        service.delete(key)
+        self.assertFalse(client.objects)
+
+    def test_legacy_local_reference_remains_readable_for_migration(self):
+        with tempfile.TemporaryDirectory() as upload_dir:
+            path = Path(upload_dir) / "legacy.pdf"
+            path.write_bytes(b"legacy-pdf")
+            config = Settings(
+                OBJECT_STORAGE_BACKEND="local",
+                LEGACY_UPLOAD_DIR=Path(upload_dir),
+            )
+            service = StorageService(config)
+
+            self.assertTrue(service.is_legacy_reference(str(path)))
+            self.assertEqual(service.get_bytes(str(path)), b"legacy-pdf")
+
+    def test_network_failure_is_normalized_to_storage_error(self):
+        client = self.FakeS3()
+        client.head_bucket = lambda **kwargs: (_ for _ in ()).throw(
+            EndpointConnectionError(endpoint_url="https://objects.example.test")
+        )
+        config = Settings(
+            OBJECT_STORAGE_BACKEND="s3",
+            S3_BUCKET="test-pdfs",
+            S3_ENDPOINT_URL="https://objects.example.test",
+        )
+
+        with self.assertRaises(ObjectStorageError):
+            StorageService(config, client=client).put_pdf("document.pdf", b"pdf")
+
+
+class UploadEndpointTests(unittest.TestCase):
+    def test_upload_writes_content_addressed_object_before_enqueuing(self):
+        document = fitz.open()
+        page = document.new_page()
+        page.insert_text((72, 72), "Object storage test")
+        content = document.tobytes()
+        document.close()
+        upload = UploadFile(
+            BytesIO(content),
+            size=len(content),
+            filename="course.pdf",
+            headers=Headers({"content-type": "application/pdf"}),
+        )
+        course = SimpleNamespace(id="course-uuid", display_name="CYBER")
+        db = SimpleNamespace(execute=AsyncMock(), rollback=AsyncMock())
+
+        with (
+            patch.object(
+                ingest.course_service,
+                "get_or_create",
+                AsyncMock(return_value=course),
+            ),
+            patch.object(
+                ingest.upload_service,
+                "find_duplicate",
+                AsyncMock(return_value=None),
+            ),
+            patch.object(ingest.upload_service, "create_upload", AsyncMock()),
+            patch.object(ingest.storage_service, "put_pdf") as put_pdf,
+            patch.object(
+                ingest.process_pdf_task,
+                "apply_async",
+                return_value=SimpleNamespace(id="task-1"),
+            ) as enqueue,
+        ):
+            response = asyncio.run(ingest.upload_document(" CYBER ", upload, db))
+
+        key = put_pdf.call_args.args[0]
+        self.assertTrue(key.startswith("courses/course-uuid/documents/"))
+        self.assertTrue(key.endswith(".pdf"))
+        self.assertEqual(put_pdf.call_args.args[1], content)
+        self.assertEqual(response.task_id, "task-1")
+        self.assertEqual(enqueue.call_args.kwargs["args"][1], key)
+
+    def test_failed_duplicate_deletion_keeps_shared_object(self):
+        record = SimpleNamespace(
+            upload_id="failed-duplicate",
+            storage_key="courses/course-1/documents/hash.pdf",
+        )
+        db = SimpleNamespace(rollback=AsyncMock())
+
+        with (
+            patch.object(
+                ingest.upload_service,
+                "lock_failed_for_deletion",
+                AsyncMock(return_value=record),
+            ),
+            patch.object(
+                ingest.upload_service,
+                "storage_key_is_shared",
+                AsyncMock(return_value=True),
+            ),
+            patch.object(
+                ingest.upload_service,
+                "delete_failed",
+                AsyncMock(return_value=record),
+            ),
+            patch.object(ingest.storage_service, "delete") as delete_object,
+        ):
+            asyncio.run(ingest.remove_failed_upload(record.upload_id, db))
+
+        delete_object.assert_not_called()
+
 
 class ProcessingFencingTests(unittest.TestCase):
     def test_stale_or_failed_attempt_cannot_advance_stage(self):
@@ -268,7 +446,7 @@ class RetryEndpointTests(unittest.TestCase):
                 course_uuid="course-uuid",
                 course_id="CYBER",
                 original_filename="course.pdf",
-                stored_file_path=str(Path(source.name)),
+                storage_key=str(Path(source.name)),
                 stage="FAILED",
                 retryable=True,
             )
@@ -290,6 +468,7 @@ class RetryEndpointTests(unittest.TestCase):
                     "apply_async",
                     side_effect=ConnectionError("broker unavailable"),
                 ),
+                patch.object(ingest.storage_service, "exists", return_value=True),
             ):
                 with self.assertRaises(HTTPException) as raised:
                     asyncio.run(ingest.retry_upload(record.upload_id, SimpleNamespace()))

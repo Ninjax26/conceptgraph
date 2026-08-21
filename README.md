@@ -95,6 +95,7 @@ This starts:
 - Qdrant on `6333`
 - PostgreSQL on `5432`
 - Redis on `6379`
+- MinIO S3 API on `9000` and console on `9001`
 
 ### 2. Configure environment variables
 
@@ -120,7 +121,18 @@ POSTGRES_PASSWORD=conceptgraph_password
 POSTGRES_DB=conceptgraph
 
 REDIS_URL=redis://localhost:6379/0
+
+OBJECT_STORAGE_BACKEND=s3
+S3_BUCKET=conceptgraph-pdfs
+S3_REGION=us-east-1
+S3_ENDPOINT_URL=http://localhost:9000
+S3_ACCESS_KEY_ID=conceptgraph
+S3_SECRET_ACCESS_KEY=conceptgraph_local_only
+S3_FORCE_PATH_STYLE=true
+S3_AUTO_CREATE_BUCKET=true
 ```
+
+These object-storage credentials are development-only defaults for the local MinIO container. Use a private bucket and platform-managed secrets in deployment.
 
 If you are on Apple Silicon and run into fork safety issues, set:
 
@@ -156,8 +168,8 @@ Open the app at `http://127.0.0.1:5173`.
 ### Ingestion
 
 1. Upload a PDF through the frontend.
-2. FastAPI accepts the file and queues a Celery task.
-3. The worker extracts text with PyMuPDF.
+2. FastAPI validates and hashes the PDF, then writes it to a content-addressed S3 object key.
+3. The worker reads the same immutable object and extracts text with PyMuPDF.
 4. LangChain chunks the document.
 5. Chunk embeddings are generated and stored in Qdrant.
 6. The LLM extracts concepts and prerequisite relationships.
@@ -177,7 +189,7 @@ Open the app at `http://127.0.0.1:5173`.
 
 | Stage | Input | Output / storage | Success condition | Failure condition |
 | --- | --- | --- | --- | --- |
-| Upload | PDF + course name | `courses`, `document_uploads`, stored PDF | Valid PDF, canonical course, unique course/hash document | Invalid, encrypted, oversized, or malformed PDF |
+| Upload | PDF + course name | `courses`, `document_uploads`, S3 object | Valid PDF, canonical course, unique course/hash document | Invalid, encrypted, oversized, malformed, or unavailable object storage |
 | Extract | Stored PDF | Page text in worker memory | At least one readable page | Empty/scanned PDF or missing source |
 | Chunk | Page text | Typed chunks with document/page/section metadata | At least one non-empty chunk | No valid chunks |
 | Embed | Chunks | Qdrant points filtered by READY document ID | Every chunk upsert completes | Vector service/model failure |
@@ -260,7 +272,34 @@ docker build -f Dockerfile.frontend \
 
 `Dockerfile.api` runs as the non-root `conceptgraph` user and exposes port `8000`. `Dockerfile.frontend` uses a multi-stage Node build and serves the compiled SPA from unprivileged Nginx on port `8080`; its Nginx configuration includes `/dashboard` fallback routing and `/healthz`.
 
-The current upload pipeline still requires the API and worker to share `data/uploads`. For a multi-instance cloud deployment, replace that path contract with object storage before scaling the services independently.
+The API and worker exchange an opaque S3 object key through PostgreSQL/Celery, so they do not require a shared filesystem. The default local S3-compatible service is MinIO; production can use AWS S3, Cloudflare R2, or another compatible private bucket.
+
+## Render Deployment
+
+[`render.yaml`](render.yaml) defines a Render Blueprint with:
+
+- Docker-based FastAPI and Celery services.
+- A static Vite frontend with SPA rewrites and security headers.
+- Render PostgreSQL and Render Key Value.
+- External Neo4j, Qdrant, and S3-compatible service settings supplied as secrets.
+
+The API and worker use `standard` compute because the local PyTorch/SentenceTransformers models require materially more memory than a typical lightweight web process. PostgreSQL uses `basic-256mb`, and Key Value uses `starter`; review current Render pricing before creating the Blueprint.
+
+Before the first Blueprint sync, prepare private Neo4j, Qdrant, and S3-compatible services. Render prompts for every `sync: false` value. Set:
+
+- `VITE_API_BASE_URL` to `https://<api-service>.onrender.com/api/v1`.
+- `CORS_ALLOWED_ORIGINS` to the frontend URL, without a trailing slash.
+- `S3_ENDPOINT_URL` to the provider endpoint; use an empty value for AWS S3.
+- `S3_FORCE_PATH_STYLE=true` only when required by the selected provider.
+
+Existing installations that have local `data/uploads` records must migrate before moving the database to cloud infrastructure:
+
+```bash
+python -m scripts.migrate_pdfs_to_object_storage --dry-run
+python -m scripts.migrate_pdfs_to_object_storage
+```
+
+The command copies each legacy file, verifies the object write returned successfully, and then commits its object key. It does not delete the local source files. Back up PostgreSQL and `data/uploads` before migration.
 
 Query and exam responses use the same course readiness rules:
 
@@ -318,7 +357,7 @@ Run backend rules and frontend production checks with:
 npm run build
 ```
 
-The backend tests cover course normalization and logical duplicate summaries, failure retryability, READY gating, citation deduplication, missing graph endpoints, and duplicate relationships.
+The backend tests cover course normalization and logical duplicate summaries, failure retryability, READY gating, citation deduplication, missing graph endpoints, duplicate relationships, object-storage round trips, legacy reads, cloud database URLs, and PDF range responses.
 
 ## Notes
 

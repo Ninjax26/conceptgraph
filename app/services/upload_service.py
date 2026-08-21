@@ -21,7 +21,7 @@ class UploadService:
         course: Course,
         content_hash: str,
         original_filename: str,
-        stored_file_path: str,
+        storage_key: str,
     ) -> DocumentUpload:
         now = datetime.now(timezone.utc)
         record = DocumentUpload(
@@ -34,7 +34,7 @@ class UploadService:
             # part of the product or retrieval model.
             week_number=1,
             original_filename=original_filename,
-            stored_file_path=stored_file_path,
+            storage_key=storage_key,
             status="active",
             stage=ProcessingStage.UPLOADED.value,
             retryable=False,
@@ -171,6 +171,35 @@ class UploadService:
         await session.delete(record)
         await session.commit()
         return record
+
+    async def lock_failed_for_deletion(
+        self,
+        session: AsyncSession,
+        upload_id: str,
+    ) -> DocumentUpload | None:
+        result = await session.execute(
+            select(DocumentUpload)
+            .where(DocumentUpload.upload_id == upload_id)
+            .with_for_update()
+        )
+        record = result.scalar_one_or_none()
+        if record is None or record.stage != ProcessingStage.FAILED.value:
+            return None
+        return record
+
+    async def storage_key_is_shared(
+        self,
+        session: AsyncSession,
+        storage_key: str,
+        excluding_upload_id: str,
+    ) -> bool:
+        result = await session.execute(
+            select(func.count(DocumentUpload.upload_id)).where(
+                DocumentUpload.storage_key == storage_key,
+                DocumentUpload.upload_id != excluding_upload_id,
+            )
+        )
+        return int(result.scalar_one()) > 0
 
     async def set_stage(
         self,

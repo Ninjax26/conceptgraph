@@ -39,11 +39,22 @@ def classify_failure(exc: Exception) -> tuple[FailureCategory, bool, str]:
         return FailureCategory.CONFIGURATION_ERROR, False, "The AI provider is not configured. Ask an administrator to update the server configuration."
     if any(term in message for term in ("password", "encrypted", "malformed", "no extractable text", "no readable text")):
         return FailureCategory.DOCUMENT_ERROR, False, "This PDF cannot be processed. Upload a readable, non-encrypted PDF."
-    if "not found" in message and ("file" in message or "pdf" in message):
+    if "not found" in message and ("file" in message or "pdf" in message or "object" in message):
         return FailureCategory.DOCUMENT_ERROR, False, "The source PDF is no longer available. Upload it again."
     if any(term in message for term in ("timeout", "timed out", "429", "rate_limit", "temporarily busy")):
         return FailureCategory.TIMEOUT_ERROR, True, "The AI service is temporarily busy. Retry in a minute."
-    if any(term in message for term in ("database", "postgres", "qdrant", "neo4j", "connection")):
+    if any(
+        term in message
+        for term in (
+            "database",
+            "postgres",
+            "qdrant",
+            "neo4j",
+            "connection",
+            "object storage",
+            "bucket",
+        )
+    ):
         return FailureCategory.DATABASE_ERROR, True, "A storage service is temporarily unavailable. Please retry."
     if any(term in message for term in ("different loop", "worker", "interrupted")):
         return FailureCategory.WORKER_ERROR, True, "Processing was interrupted. Please retry."

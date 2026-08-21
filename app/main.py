@@ -9,6 +9,7 @@ from app.api.endpoints.ingest import router as ingest_router
 from app.api.endpoints.query import router as query_router
 from app.core.database import close_database_connections, initialize_database_schema
 from app.core.database import postgres_engine
+from app.core.config import settings
 from sqlalchemy import text
 
 LOCAL_DEV_ORIGIN_REGEX = r"https?://(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?$"
@@ -32,6 +33,7 @@ app.add_middleware(
         "http://127.0.0.1:5173",
         "http://0.0.0.0:3000",
         "http://0.0.0.0:5173",
+        *settings.configured_cors_origins,
     ],
     allow_origin_regex=LOCAL_DEV_ORIGIN_REGEX,
     allow_credentials=True,

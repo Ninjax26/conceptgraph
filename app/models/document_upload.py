@@ -30,7 +30,9 @@ class DocumentUpload(Base):
     content_hash: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)
     week_number: Mapped[int] = mapped_column(nullable=False)
     original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
-    stored_file_path: Mapped[str] = mapped_column(Text, nullable=False)
+    # Keep the existing SQL column name for backward compatibility while the
+    # application treats its value as an opaque object-storage key.
+    storage_key: Mapped[str] = mapped_column("stored_file_path", Text, nullable=False)
     status: Mapped[str] = mapped_column(String(32), index=True, nullable=False, default="queued")
     stage: Mapped[str] = mapped_column(String(32), index=True, nullable=False, default="UPLOADED")
     failure_category: Mapped[str | None] = mapped_column(String(32), nullable=True)

@@ -52,3 +52,18 @@ services:
     volumes:
       - ./data/redis:/data
     command: ["redis-server", "--appendonly", "yes"]
+
+  minio:
+    image: minio/minio:latest
+    platform: linux/arm64
+    container_name: conceptgraph-minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY_ID:-conceptgraph}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_ACCESS_KEY:-conceptgraph_local_only}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - ./data/minio:/data
+    command: ["server", "/data", "--console-address", ":9001"]

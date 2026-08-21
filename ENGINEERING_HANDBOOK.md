@@ -51,7 +51,7 @@ There is no implemented user account, organization, role, or access-control mode
 ### Current limitations
 
 - No authentication, authorization, tenant boundary, rate limiting, CSRF protection, malware scanning, or audit log.
-- Uploaded files are stored on one local filesystem, which prevents transparent horizontal API/worker scaling.
+- PDFs use shared S3-compatible object storage, but there is no lifecycle policy, retention class, bucket event audit, or tenant-specific prefix authorization.
 - SQL schema migration is handwritten at startup; there is no Alembic history or rollback.
 - PostgreSQL uses `NullPool`, trading loop safety for connection churn.
 - The worker has no configured Celery retry policy, hard/soft time limit, task acknowledgment policy, dead-letter queue, or distributed per-document execution lock.
@@ -63,7 +63,7 @@ There is no implemented user account, organization, role, or access-control mode
 - Exam generation scrolls all matching chunks, then selects at most twelve deduplicated excerpts round-robin across document/topic groups. Selection is coverage-aware but not semantically ranked.
 - Citation relevance is inferred from reranking; there is no entailment check connecting individual claims to sources.
 - `source_id` is stable only within one response, not across requests.
-- Tests cover a narrow set of pure rules and one mocked readiness case. There are no API, worker, database integration, frontend, load, security, or end-to-end tests in the repository.
+- Tests cover twenty-two focused rules and mocked service cases. There are still no real API, worker, database, S3, frontend, load, security, or end-to-end integration tests in the repository.
 
 ## 2. System Architecture
 
@@ -74,7 +74,7 @@ flowchart LR
     API -->|control-plane rows| PG[("PostgreSQL 16")]
     API -->|publish task| R[("Redis 7 broker/backend")]
     R --> W["Celery solo worker"]
-    W -->|read local PDF| FS[("data/uploads filesystem")]
+    W -->|read PDF object| S3[("S3-compatible object storage")]
     W -->|status and attempts| PG
     W -->|chunk vectors + payload| Q[("Qdrant")]
     W -->|concepts + relationships| N[("Neo4j 5")]
@@ -82,7 +82,7 @@ flowchart LR
     API -->|semantic search / course scroll| Q
     API -->|graph queries| N
     API -->|answer / exam generation| LLM
-    API -->|PDF bytes| FS
+    API -->|put/get/delete PDF| S3
 ```
 
 ### Component responsibilities
@@ -94,7 +94,7 @@ flowchart LR
 | Celery worker | Keeps parsing, embedding, and graph extraction off the HTTP event loop | `app/tasks/document_tasks.py` |
 | Redis | Celery broker and result backend | `REDIS_URL`, `docker-compose.yml` |
 | PostgreSQL | Source of truth for courses, documents, attempts, stages, counts, and safe errors | SQLAlchemy models in `app/models/document_upload.py` |
-| Filesystem | Stores original PDFs under UUID filenames | `data/uploads/{upload_id}.pdf` |
+| S3-compatible storage | Stores private, content-addressed original PDFs shared by API and workers | `StorageService`; local MinIO or cloud S3/R2 |
 | Qdrant | Stores normalized dense vectors and chunk payloads for semantic/filter retrieval | `IngestionService.upsert_chunks_to_qdrant` |
 | Neo4j | Stores Course and Concept nodes plus typed concept relationships | `IngestionService.store_graph_extraction` |
 | SentenceTransformers | Local embedding and cross-encoder reranking | `all-MiniLM-L6-v2`; `cross-encoder/ms-marco-MiniLM-L-6-v2` |
@@ -102,7 +102,7 @@ flowchart LR
 
 ### Deployment topology
 
-`docker-compose.yml` starts PostgreSQL, Redis, Qdrant, and Neo4j only. FastAPI, Celery, and Vite are started as host processes according to the README. All databases publish ports to the host and use bind-mounted data directories. No reverse proxy, TLS endpoint, container health check, orchestration manifest, production process supervisor, or cloud deployment configuration is implemented.
+`docker-compose.yml` starts PostgreSQL, Redis, Qdrant, Neo4j, and MinIO for local development; FastAPI, Celery, and Vite can still run as host processes. `Dockerfile.api` serves API and worker roles, `Dockerfile.frontend` serves the SPA through unprivileged Nginx, and `render.yaml` defines a Render Blueprint for API, worker, frontend, PostgreSQL, and Key Value. Neo4j, Qdrant, and private S3-compatible storage remain external managed dependencies. TLS is delegated to Render. Authentication and network-level tenant isolation are still absent.
 
 ## 3. End-to-End Request Flows
 
@@ -114,6 +114,7 @@ sequenceDiagram
     participant UI as UploadModal
     participant API as upload_document
     participant PG as PostgreSQL
+    participant S3 as Object storage
     participant Redis
     participant Worker as process_pdf_task
     participant PDF as ParserService
@@ -124,19 +125,20 @@ sequenceDiagram
     User->>UI: choose PDF and course
     UI->>API: POST /api/v1/ingest/upload
     API->>API: validate extension, MIME, size, PDF structure
-    API->>API: persist temporary UUID-named file and SHA-256 it
+    API->>API: read bounded bytes, validate PDF, calculate SHA-256
     API->>PG: advisory lock by normalized course name
     API->>PG: get/create Course; check course + hash duplicate
     alt duplicate exists
-        API->>API: delete newly copied file
         API-->>UI: existing document, duplicate=true
     else new document
+        API->>S3: put content-addressed private PDF object
         API->>PG: insert DocumentUpload + ProcessingAttempt
         API->>Redis: process_pdf_task.apply_async
         API-->>UI: 202 UPLOADED
         Redis->>Worker: deliver task
         Worker->>PG: EXTRACTING
-        Worker->>PDF: extract_pages
+        Worker->>S3: get PDF object
+        Worker->>PDF: extract_pages_from_bytes
         Worker->>PG: EXTRACTED then CHUNKING
         Worker->>PDF: chunk_pages
         Worker->>PG: CHUNKED then EMBEDDING
@@ -150,7 +152,7 @@ sequenceDiagram
 
 Function chain:
 
-`UploadModal.handleSubmit` → `uploadDocument` → `upload_document` → `_sha256_file` → `CourseService.get_or_create` / `resolve` → `UploadService.find_duplicate` → `UploadService.create_upload` → `process_pdf_task.apply_async` → `process_pdf_task` → `ParserService.extract_pages` → `ParserService.chunk_pages` → `IngestionService.upsert_chunks_to_qdrant` → `IngestionService.extract_graph_from_chunks` → `extract_graph_from_text` → provider-specific extraction → `store_graph_extraction` → `UploadService.mark_completed`.
+`UploadModal.handleSubmit` → `uploadDocument` → `upload_document` → in-memory SHA-256 → `CourseService.get_or_create` / `resolve` → `UploadService.find_duplicate` → `StorageService.put_pdf` → `UploadService.create_upload` → `process_pdf_task.apply_async` → `process_pdf_task` → `StorageService.get_bytes` → `ParserService.extract_pages_from_bytes` → `ParserService.chunk_pages` → `IngestionService.upsert_chunks_to_qdrant` → `IngestionService.extract_graph_from_chunks` → provider-specific extraction → `store_graph_extraction` → `UploadService.mark_completed`.
 
 Failure path: worker catches `LLMConfigurationError` or any `Exception`, classifies it with `classify_failure`, attempts `IngestionService.cleanup_upload`, writes a safe failure into both current document and current attempt, and returns a failed Celery result. Cleanup failure is logged and does not replace the original processing failure.
 
@@ -159,8 +161,8 @@ Failure path: worker catches `LLMConfigurationError` or any `Exception`, classif
 - The dashboard loads `listUploads()` and `listCourses()` together on mount. The dedicated course summary endpoint prevents selector contents from depending on the truncated queue. `list_uploads` first calls `expire_stale_uploads`, marking active records older than 15 minutes as `WORKER_ERROR` failures and preserving the three-attempt retry cap.
 - While any displayed job is active, a 2.5-second browser interval calls `GET /status/{task_id}` for each active task. When a task becomes terminal, the dashboard refreshes course summaries; a newly uploaded course is automatically selected when it becomes READY. A fresh dashboard session defaults to the most recently updated READY course.
 - Retry calls `POST /uploads/{upload_id}/retry`. The service takes a PostgreSQL `FOR UPDATE` row lock and admits only `FAILED`, retryable records below three attempts. It updates the same document, creates a new `ProcessingAttempt`, and publishes a new task ID.
-- Preview looks up the document row and streams the stored local PDF through `FileResponse`.
-- Deletion permits only a failed database record, deletes it and cascaded attempts, then unlinks the PDF. It does not call Qdrant/Neo4j cleanup at deletion time; the worker is expected to have cleaned partial data.
+- Preview looks up the document row, reads the private object through the API, and supports single HTTP byte ranges for browser PDF viewers. Bucket credentials and object keys are never exposed to the browser.
+- Deletion locks a failed row, checks whether historical rows share its content-addressed object, deletes only an unshared object, then deletes the database row and cascaded attempts. The row lock serializes deletion against retry admission. It does not call Qdrant/Neo4j cleanup at deletion time; the worker is expected to have cleaned partial data.
 
 ### 3.3 Grounded query
 
@@ -198,11 +200,12 @@ Unlike query retrieval, exam retrieval performs no semantic search. It scrolls e
 | Stage | Input | Output | Storage | Relevant function | Success | Failure |
 | --- | --- | --- | --- | --- | --- | --- |
 | Browser validation | File, course text | Accepted form | Browser memory | `UploadModal` handlers | `.pdf`, MIME, ≤10 MiB, non-empty course | Client error message |
-| API upload validation | Multipart file | UUID-named PDF | Local `data/uploads` | `upload_document` | readable PDF with pages, no password | 400/413 and file removal |
+| API upload validation | Multipart file | bounded validated bytes + SHA-256 | API memory | `upload_document` | readable PDF with pages, no password, ≤10 MiB | 400/413 |
+| Source-object write | PDF bytes + course/hash | immutable object key | S3-compatible storage | `StorageService.put_pdf` | object write succeeds | 503; DB transaction rolls back, while the content-addressed object is retained because commit outcome can be ambiguous |
 | Course resolution | Display text | `Course` | PostgreSQL | `get_or_create`, `resolve` | deterministic ID or existing normalized row | 400 empty; race/DB error |
 | Duplicate detection | Course UUID, SHA-256 | existing/new decision | PostgreSQL | `find_duplicate` | one existing record reused or new row | DB failure → 503 |
 | Task creation | Document metadata | document + attempt | PostgreSQL/Redis | `create_upload`, `apply_async` | committed rows and broker publish | broker failure marks the saved document as retryable `WORKER_ERROR` and returns 503 |
-| Extraction | PDF path | `(page, text)` list | worker memory | `extract_pages` | at least one textual page eventually yields chunks | missing, malformed, encrypted, scanned/empty |
+| Extraction | PDF object bytes | `(page, text)` list | object storage/worker memory | `get_bytes`, `extract_pages_from_bytes` | at least one textual page eventually yields chunks | missing object, malformed, encrypted, scanned/empty |
 | Chunking | Page text | `DocumentChunk[]` | worker memory | `chunk_pages` | ≥1 chunk | empty list → document error |
 | Embedding | Chunk text | normalized vectors | model memory | `embedding_model.encode` | vector for each chunk | model/device/runtime error |
 | Vector write | Vectors + payload | points | Qdrant | `upsert_chunks_to_qdrant` | upsert returns | service/schema error |
@@ -251,6 +254,7 @@ Unlike query retrieval, exam retrieval performs no semantic search. It scrolls e
 | `app/services/rag_service.py` | Graph query, totals, vector search, query expansion, and an unused provider-specific Cypher generation capability. Qdrant calls are moved to a thread by `retrieve`; Neo4j uses async APIs. |
 | `app/services/rerank_service.py` | Eagerly loads a `CrossEncoder` when service is first dependency-resolved; predicts scores and sorts descending. |
 | `app/services/citation_service.py` | Builds up to four readable, deduplicated source objects. Internal point IDs are omitted, though `document_id` and `metadata.upload_id` are still sent to the frontend. |
+| `app/services/storage_service.py` | S3-compatible PDF put/get/head/delete operations, content-addressed keys, local MinIO support, and constrained legacy-file fallback. |
 | `app/services/synthesis_service.py` | Provider validation, prompt assembly, Groq/Gemini dispatch, weak-evidence fallback, and answer ID sanitization. |
 | `app/services/exam_service.py` | Filter-only course chunk scrolling, bounded context assembly, provider dispatch, strict JSON parsing and exact-count enforcement. |
 | `app/services/graph_service.py` | Empty placeholder (one line). It implements no behavior. |
@@ -260,7 +264,7 @@ Unlike query retrieval, exam retrieval performs no semantic search. It scrolls e
 
 | File | Routes |
 | --- | --- |
-| `app/api/endpoints/ingest.py` | Upload, status, list, retry, preview, and failed-record deletion. Creates `data/uploads` at import time. |
+| `app/api/endpoints/ingest.py` | Upload, status, list, retry, object-backed byte-range preview, and row-locked failed-record deletion. |
 | `app/api/endpoints/query.py` | `POST /api/v1/query`; readiness → graph/vector retrieval → rerank → citation → synthesis. Cached service factories hold loaded models. |
 | `app/api/endpoints/exam.py` | `POST /api/v1/exam/generate`; shared readiness → course-wide filtered retrieval → structured generation. |
 
@@ -288,7 +292,9 @@ Unlike query retrieval, exam retrieval performs no semantic search. It scrolls e
 
 | File | Purpose |
 | --- | --- |
-| `docker-compose.yml` | Four stateful local services, host ports, ARM64 platform, persistent bind mounts. |
+| `docker-compose.yml` | Five stateful local services including MinIO, host ports, ARM64 platform, and persistent bind mounts. |
+| `render.yaml` | Render Blueprint for API, worker, static frontend, PostgreSQL, and Key Value; external service credentials remain dashboard secrets. |
+| `scripts/migrate_pdfs_to_object_storage.py` | Dry-run-capable one-time copy and database-key migration for legacy local PDFs. |
 | `requirements.txt` | Unpinned Python dependencies. Reproducibility is not guaranteed across fresh installs. |
 | `package.json` / `package-lock.json` | Frontend scripts and locked npm dependency graph. |
 | `vite.config.ts`, `tsconfig*.json`, `tailwind.config.ts`, `postcss.config.js` | Frontend build, type, path alias, Tailwind, and PostCSS configuration. |
@@ -325,7 +331,7 @@ Course summaries and READY retrieval additionally collapse historical rows shari
 | `content_hash` | `VARCHAR(64)` | Nullable, indexed SHA-256 hex digest |
 | `week_number` | integer | Non-null legacy column; every new upload stores `1`; not product-facing |
 | `original_filename` | `VARCHAR(255)` | Client-provided filename |
-| `stored_file_path` | text | Local relative path |
+| `stored_file_path` | text | Compatibility SQL column mapped as `storage_key`; new rows contain opaque S3 object keys, while legacy rows can contain constrained local paths until migrated |
 | `status` | `VARCHAR(32)` | Indexed coarse UI class: active/ready/failed/cancelled |
 | `stage` | `VARCHAR(32)` | Indexed durable processing stage |
 | `failure_category` | `VARCHAR(32)` | Nullable classification string |
@@ -629,7 +635,7 @@ Maximum attempts are three total, including the original. `mark_failed` clears r
 | Frontend | Polls every active item every 2.5 s; one large dashboard component; graph COSE layout on main thread | SSE/WebSocket aggregate status, pagination, virtualized lists, graph worker/layout limits |
 | API | Sync Qdrant client requires thread offload in query/exam; no server timeouts; model initialization can stall first request | async Qdrant client, model warmup, multiple Uvicorn workers, explicit deadlines |
 | PostgreSQL | `NullPool` opens connections frequently; list fetches 100 then groups in Python | bounded async pool per process/loop, SQL grouping/pagination, composite indexes/constraints |
-| Filesystem | one host’s disk, orphan risk, no quota | object storage with content-addressed keys and signed access |
+| Object storage | API proxies full objects into memory; no lifecycle policy, quota, or direct signed preview | ranged provider reads, short-lived signed access, retention/lifecycle rules, quotas |
 | Celery | documented single solo worker; one PDF at a time; heavyweight models per worker | dedicated queues/stages, multiple workers, model-serving process, GPU batch embedding |
 | Embedding | all chunks encoded in one call; memory scales with document chunk count | bounded batches, backpressure, model server, GPU/CUDA support |
 | Qdrant | no payload index; one collection; no model version | index `upload_id`, shard/replicate, collection alias by embedding version, batch APIs |
@@ -640,7 +646,7 @@ Maximum attempts are three total, including the original. `mark_failed` clears r
 | Exam | scrolls every course chunk before selecting twelve | indexed topic summaries, semantic selection, and a server-side scroll cap |
 | LLM | dominant latency, external rate limits, 60 s browser timeout | provider timeout/retry/circuit breaker, streaming, caching, smaller prompts |
 
-At 100,000 PDFs, the current design breaks operationally before raw database capacity: local disk is not shared; a solo worker creates an enormous queue; course-wide exam scroll is unbounded; missing Qdrant/Neo4j indexes increase latency; no tenant quotas exist; models are replicated per process; and one collection/schema has no embedding-version migration story.
+At 100,000 PDFs, the current design breaks operationally before raw database capacity: a solo worker creates an enormous queue; course-wide exam scroll is unbounded; API-proxied PDF previews consume memory/bandwidth; missing Qdrant/Neo4j indexes increase latency; no tenant quotas exist; models are replicated per process; and one collection/schema has no embedding-version migration story.
 
 Memory worst cases include loading all page chunks for one PDF, encoding them as one batch, collecting all course chunks for an exam, and rendering a large graph. API graph reads are capped at 50 concepts, but total counting still traverses the scoped graph.
 
@@ -697,7 +703,7 @@ Memory worst cases include loading all page chunks for one PDF, encoding them as
 2. Add authentication, authorization, ownership on courses/documents, and production secret/network configuration.
 3. Replace startup DDL with Alembic; add `(course_uuid, content_hash)` uniqueness, state/count checks, and Neo4j/Qdrant indexes.
 4. Add an outbox/reconciliation process for broker publication and cross-store orphan detection.
-5. Put PDFs in shared object storage and add quotas, page/CPU limits, malware scanning, and OCR workflow.
+5. Add object lifecycle/retention rules, quotas, page/CPU limits, malware scanning, ranged provider reads, and an OCR workflow.
 6. Add structured exception types, provider/storage timeouts, circuit breakers, and consistent API error taxonomy.
 7. Redesign exam context selection to bounded, diverse topic/page coverage without scrolling an entire course.
 8. Version embedding collections and payload schemas; provide explicit re-embedding migration.
@@ -726,7 +732,7 @@ Memory worst cases include loading all page chunks for one PDF, encoding them as
 - SSE status updates and server-side pagination.
 - Structured error hierarchy and provider retries with jitter.
 - Neo4j constraints, indexes, batched transactions.
-- Shared object storage and signed preview URLs.
+- Object lifecycle/versioning plus ranged provider reads or short-lived signed preview URLs.
 - Deterministic fake-provider integration test suite.
 
 ### Hard
@@ -751,7 +757,7 @@ These answers defend the implementation honestly. A strong interview answer shou
 
 ### Architecture and distributed systems
 
-1. **What is the source of truth?** PostgreSQL is authoritative for course identity, document readiness, retryability, attempts, and output counts. Qdrant and Neo4j are derived indexes. The original PDF on local disk is the recoverable source artifact, but the system currently lacks an automated rebuild command.
+1. **What is the source of truth?** PostgreSQL is authoritative for course identity, document readiness, retryability, attempts, output counts, and the PDF object key. The private S3 object is the recoverable source artifact; Qdrant and Neo4j are derived indexes. The system still lacks an automated derived-store rebuild command.
 
 2. **Why use three databases?** PostgreSQL supplies transactions and constraints for workflow state, Qdrant supplies vector ANN and payload filtering, and Neo4j supplies typed graph traversal. This demonstrates specialized stores but creates distributed consistency cost; at current scale, PostgreSQL plus pgvector and relational edges would be a credible simplification.
 
@@ -769,7 +775,7 @@ These answers defend the implementation honestly. A strong interview answer shou
 
 9. **Why is the documented worker single-concurrency?** `--pool=solo --concurrency=1` avoids macOS/PyTorch fork and async-loop issues and makes local execution reliable. It is not a scalable production topology.
 
-10. **How would horizontal worker scaling work?** Shared object storage must replace local files; workers need a per-document execution lease; models should be warmed or served centrally; queues can separate parsing, embedding, graph extraction, and providers; all writes remain idempotent.
+10. **How would horizontal worker scaling work?** Shared object storage now removes host affinity, but workers still need a per-document execution lease; models should be warmed or served centrally; queues can separate parsing, embedding, graph extraction, and providers; all writes must remain idempotent.
 
 11. **What idempotency exists?** Course IDs are deterministic, duplicate files are SHA-256 checked per course, chunk IDs and Qdrant point IDs are deterministic, graph concept IDs include course/upload/source ID, and retry reuses the document. Broker publication itself has no outbox idempotency.
 
@@ -823,7 +829,7 @@ These answers defend the implementation honestly. A strong interview answer shou
 
 35. **Does the 10 MiB limit fully protect parsing?** No. It bounds input bytes, but a small compressed PDF can have many pages or expensive structures. Page count, parse time, decompressed objects, and CPU need limits/sandboxing.
 
-36. **What does deletion remove?** Failed PostgreSQL document and cascaded attempts, then local PDF. It does not explicitly remove vector/graph data at deletion time.
+36. **What does deletion remove?** It row-locks a failed document, deletes its PDF object only when no historical row shares that key, then deletes the PostgreSQL document and cascaded attempts. It does not explicitly remove vector/graph data at deletion time.
 
 37. **Why overwrite `task_id` on retry?** It makes document status point to the current attempt and simplifies polling. The cost is that old `/status/{task_id}` lookups fail despite attempt history retaining those IDs.
 
@@ -963,7 +969,7 @@ These answers defend the implementation honestly. A strong interview answer shou
 
 **Why maintain Neo4j if vector retrieval can answer independently?** The current product uses graph context for query expansion and visualization. Whether that value justifies a database must be measured against vector-only retrieval; the repository contains no such evaluation.
 
-**What breaks at 100,000 PDFs?** Local storage, single-worker throughput, unbounded exam scroll, missing payload/graph indexes, model replication, polling fan-out, absent quotas, and cross-store reconciliation all become blockers.
+**What breaks at 100,000 PDFs?** Single-worker throughput, unbounded exam scroll, API-proxied object reads, missing payload/graph indexes, model replication, polling fan-out, absent quotas, and cross-store reconciliation all become blockers.
 
 **Neo4j is down. Why does the whole question fail?** Current orchestration treats graph retrieval as mandatory. A vector-only degraded path is straightforward but must be an explicit product decision and surfaced in response metadata.
 
@@ -1027,7 +1033,7 @@ These answers defend the implementation honestly. A strong interview answer shou
 
 **How would you know the graph helped an answer?** Current responses expose graph context but no ablation telemetry. Log graph expansion terms and compare retrieval/answer metrics against a vector-only shadow path.
 
-**What is your disaster-recovery plan?** None is implemented beyond bind-mounted local persistence. Production needs backups, restore drills, object-store source retention, database snapshots, and reproducible derived-index rebuilds.
+**What is your disaster-recovery plan?** No automated recovery is implemented. Production still needs tested PostgreSQL/Neo4j/Qdrant backups, object versioning and retention, restore drills, and reproducible derived-index rebuilds.
 
 ## 23. Timed Executive Explanations
 
@@ -1041,13 +1047,13 @@ For a question, both query and exam endpoints resolve the same canonical course 
 
 Start with identity and control state. User-entered course names are display metadata; `CourseService` canonicalizes them through trim, case-folding, whitespace collapse, and deterministic UUIDv5. PostgreSQL stores three entities: course, logical document, and processing attempts. SHA-256 plus course identifies duplicate content. Retry increments attempts on the same document rather than generating another logical document.
 
-The upload request does only bounded work: file/MIME/size/PDF validation, local persistence, hashing, duplicate admission under a PostgreSQL advisory lock, row creation, and Celery publication. The worker advances through explicit extraction, chunking, embedding, graph, and READY stages. Qdrant point IDs and Neo4j concept IDs are deterministic/provenance-scoped, which makes retries idempotent and cleanup targeted. Since there is no cross-database transaction, failure handling deletes partial Qdrant and Neo4j data and marks a safe classified error. Read paths filter by PostgreSQL READY IDs, so failed orphaned derived data is normally invisible.
+The upload request does bounded validation and hashing, duplicate admission under a PostgreSQL advisory lock, one content-addressed object write, row creation, and Celery publication. The worker reads that object and advances through explicit extraction, chunking, embedding, graph, and READY stages. Qdrant point IDs and Neo4j concept IDs are deterministic/provenance-scoped, which makes retries idempotent and cleanup targeted. Since there is no cross-database transaction, failure handling deletes partial Qdrant and Neo4j data and marks a safe classified error. Read paths filter by PostgreSQL READY IDs, so failed orphaned derived data is normally invisible.
 
 The query pipeline uses a deterministic read-only Cypher query, not the implemented but currently unused LLM Cypher generator. Matching concepts return bidirectional neighbors, while only incoming prerequisite sources expand the question. MiniLM cosine search retrieves ten chunks, an MS MARCO MiniLM cross-encoder reranks them, and a combined evidence gate filters weak passages before citation construction emits up to four document/page/section/passage sources. Synthesis sees no vector point IDs and is instructed to cite `[Source n]`. Graph totals and query-subgraph counts let the UI explain how much is displayed.
 
 Exam generation shares exactly the same course readiness service but retrieves by metadata rather than similarity. It scrolls the READY document chunks, bounds context, and validates exact question count, four options, and answer membership.
 
-Operationally this is local-first: Docker Compose runs four databases while API, worker, and Vite run on the host. It is not production-ready because it lacks auth, object storage, migrations, cross-store reconciliation, dependency health, structured retries/timeouts, and comprehensive tests. Those limitations are explicit rather than hidden.
+Operationally, Docker Compose supplies five local stateful services, application Docker images support API/worker/frontend, and a Render Blueprint supplies the platform topology. S3-compatible storage removes the shared-disk blocker. It is still not production-ready for untrusted public use because it lacks auth, Alembic migrations, cross-store reconciliation, malware isolation, complete dependency health, structured timeouts/circuit breakers, and comprehensive integration tests.
 
 ### Fifteen-minute architecture explanation
 
@@ -1064,7 +1070,7 @@ A fifteen-minute walkthrough should use Sections 2–12 in this order: user goal
 - Query is semantic top-k plus cross-encoder; exam is metadata scroll plus bounded context.
 - Compensation is best effort; reconciliation is missing.
 
-Conclude with the top three next investments: cross-store integration tests, security/ownership, and outbox/reconciliation plus shared object storage.
+Conclude with the top three next investments: cross-store integration tests, security/ownership, and outbox/reconciliation plus object lifecycle governance.
 
 ### Thirty-minute deep dive
 

@@ -1,13 +1,13 @@
 """API endpoints for document ingestion and upload tracking."""
 
-from pathlib import Path
-from uuid import uuid4
+import asyncio
 import hashlib
+from urllib.parse import quote
+from uuid import uuid4
 
-import shutil
 import fitz
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile, status
+from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 
@@ -15,14 +15,17 @@ from app.core.database import get_postgres_session
 from app.schemas.ingest import CourseSummaryResponse, IngestResponse, UploadStatusResponse
 from app.services.upload_service import UploadService
 from app.services.course_service import CourseService
+from app.services.storage_service import (
+    ObjectNotFoundError,
+    ObjectStorageError,
+    StorageService,
+    storage_service,
+)
 from app.core.processing import normalize_course_name
 from app.core.processing import FailureCategory
 from app.tasks.document_tasks import process_pdf_task
 
 router = APIRouter(prefix="/api/v1/ingest", tags=["ingest"])
-
-UPLOAD_DIR = Path("data/uploads")
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 upload_service = UploadService()
 course_service = CourseService()
@@ -49,17 +52,13 @@ async def upload_document(
     if not course_id:
         raise HTTPException(status_code=400, detail="course_id cannot be empty.")
 
-    upload_id = str(uuid4())
-    task_id = str(uuid4())
-    stored_file_path = UPLOAD_DIR / f"{upload_id}.pdf"
-
+    content = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="PDF files must be 10 MB or smaller.")
+    if not content:
+        raise HTTPException(status_code=400, detail="The selected PDF is empty.")
     try:
-        with stored_file_path.open("wb") as destination:
-            shutil.copyfileobj(file.file, destination)
-        if stored_file_path.stat().st_size > MAX_UPLOAD_BYTES:
-            stored_file_path.unlink(missing_ok=True)
-            raise HTTPException(status_code=413, detail="PDF files must be 10 MB or smaller.")
-        with fitz.open(stored_file_path) as document:
+        with fitz.open(stream=content, filetype="pdf") as document:
             if document.needs_pass:
                 raise HTTPException(
                     status_code=400,
@@ -68,13 +67,11 @@ async def upload_document(
             if document.page_count == 0:
                 raise HTTPException(status_code=400, detail="The PDF contains no pages.")
     except HTTPException:
-        stored_file_path.unlink(missing_ok=True)
         raise
     except Exception as exc:
-        stored_file_path.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail="The PDF is malformed or unreadable.") from exc
 
-    content_hash = _sha256_file(stored_file_path)
+    content_hash = hashlib.sha256(content).hexdigest()
     await db.execute(
         text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
         {"key": f"course:{normalize_course_name(course_id)}"},
@@ -82,12 +79,23 @@ async def upload_document(
     course = await course_service.get_or_create(db, course_id)
     duplicate = await upload_service.find_duplicate(db, course.id, content_hash)
     if duplicate is not None:
-        stored_file_path.unlink(missing_ok=True)
         return _ingest_response(
             duplicate,
             message="This PDF already exists in the course. The existing document was returned.",
             duplicate=True,
         )
+
+    upload_id = str(uuid4())
+    task_id = str(uuid4())
+    storage_key = StorageService.object_key(course.id, content_hash)
+    try:
+        await asyncio.to_thread(storage_service.put_pdf, storage_key, content)
+    except ObjectStorageError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=503,
+            detail="Document storage is temporarily unavailable. Please try again.",
+        ) from exc
 
     try:
         await upload_service.create_upload(
@@ -97,16 +105,18 @@ async def upload_document(
             course=course,
             content_hash=content_hash,
             original_filename=file.filename,
-            stored_file_path=str(stored_file_path),
+            storage_key=storage_key,
         )
     except Exception as exc:
-        if stored_file_path.exists():
-            stored_file_path.unlink(missing_ok=True)
+        await db.rollback()
+        # The commit result can be ambiguous after a connection failure. Keep
+        # the content-addressed object so a possibly committed row never loses
+        # its source; a later reconciliation job can remove true orphans.
         raise HTTPException(status_code=503, detail="Document tracking is temporarily unavailable.") from exc
 
     try:
         task = process_pdf_task.apply_async(
-            args=[upload_id, str(stored_file_path), course.id, course.display_name, file.filename],
+            args=[upload_id, storage_key, course.id, course.display_name, file.filename],
             task_id=task_id,
         )
     except Exception as exc:
@@ -253,8 +263,19 @@ async def retry_upload(
     if record is None:
         raise HTTPException(status_code=409, detail="Only failed uploads can be retried.")
 
-    pdf_path = Path(record.stored_file_path)
-    if not pdf_path.exists():
+    try:
+        source_exists = await asyncio.to_thread(storage_service.exists, record.storage_key)
+    except ObjectStorageError as exc:
+        await upload_service.mark_failed(
+            db,
+            upload_id,
+            task_id,
+            "Document storage is temporarily unavailable. Please retry when it is restored.",
+            FailureCategory.DATABASE_ERROR,
+            True,
+        )
+        raise HTTPException(status_code=503, detail="Document storage is temporarily unavailable.") from exc
+    if not source_exists:
         await upload_service.mark_failed(
             db,
             upload_id,
@@ -269,7 +290,7 @@ async def retry_upload(
         task = process_pdf_task.apply_async(
             args=[
                 record.upload_id,
-                record.stored_file_path,
+                record.storage_key,
                 record.course_uuid,
                 record.course_id,
                 record.original_filename,
@@ -303,21 +324,21 @@ async def retry_upload(
 @router.get("/uploads/{upload_id}/preview")
 async def preview_upload(
     upload_id: str,
+    range_header: str | None = Header(default=None, alias="Range"),
     db: AsyncSession = Depends(get_postgres_session),
-) -> FileResponse:
+) -> Response:
     record = await upload_service.get_upload(db, upload_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Upload not found.")
 
-    pdf_path = Path(record.stored_file_path)
-    if not pdf_path.exists():
+    try:
+        content = await asyncio.to_thread(storage_service.get_bytes, record.storage_key)
+    except ObjectNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Stored PDF is no longer available.")
+    except ObjectStorageError as exc:
+        raise HTTPException(status_code=503, detail="Document storage is temporarily unavailable.") from exc
 
-    return FileResponse(
-        path=pdf_path,
-        media_type="application/pdf",
-        filename=record.original_filename,
-    )
+    return _pdf_response(content, record.original_filename, range_header)
 
 
 @router.delete("/uploads/{upload_id}", status_code=204)
@@ -325,18 +346,70 @@ async def remove_failed_upload(
     upload_id: str,
     db: AsyncSession = Depends(get_postgres_session),
 ) -> None:
-    record = await upload_service.delete_failed(db, upload_id)
+    record = await upload_service.lock_failed_for_deletion(db, upload_id)
     if record is None:
         raise HTTPException(status_code=409, detail="Only failed document records can be removed.")
-    Path(record.stored_file_path).unlink(missing_ok=True)
+    shared_object = await upload_service.storage_key_is_shared(
+        db,
+        record.storage_key,
+        record.upload_id,
+    )
+    if not shared_object:
+        try:
+            await asyncio.to_thread(storage_service.delete, record.storage_key)
+        except ObjectStorageError as exc:
+            await db.rollback()
+            raise HTTPException(status_code=503, detail="Document storage is temporarily unavailable.") from exc
+    deleted = await upload_service.delete_failed(db, upload_id)
+    if deleted is None:
+        raise HTTPException(status_code=409, detail="The document state changed before removal.")
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for block in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+def _pdf_response(content: bytes, filename: str, range_header: str | None) -> Response:
+    total = len(content)
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Disposition": f"inline; filename*=UTF-8''{quote(filename)}",
+    }
+    if not range_header:
+        headers["Content-Length"] = str(total)
+        return Response(content=content, media_type="application/pdf", headers=headers)
+
+    try:
+        unit, requested = range_header.strip().split("=", 1)
+        if unit != "bytes" or "," in requested:
+            raise ValueError
+        start_text, end_text = requested.split("-", 1)
+        if start_text:
+            start = int(start_text)
+            end = min(int(end_text), total - 1) if end_text else total - 1
+        else:
+            suffix_length = int(end_text)
+            if suffix_length <= 0:
+                raise ValueError
+            start = max(total - suffix_length, 0)
+            end = total - 1
+        if start < 0 or start >= total or end < start:
+            raise ValueError
+    except (TypeError, ValueError):
+        return Response(
+            status_code=416,
+            headers={"Content-Range": f"bytes */{total}", "Accept-Ranges": "bytes"},
+        )
+
+    partial = content[start : end + 1]
+    headers.update(
+        {
+            "Content-Range": f"bytes {start}-{end}/{total}",
+            "Content-Length": str(len(partial)),
+        }
+    )
+    return Response(
+        content=partial,
+        status_code=206,
+        media_type="application/pdf",
+        headers=headers,
+    )
 
 
 def _ingest_response(record, *, message: str, duplicate: bool) -> IngestResponse:

@@ -11,6 +11,7 @@ from app.core.processing import ProcessingStage, classify_failure
 from app.services.upload_service import UploadService
 from app.services.ingestion_service import IngestionService
 from app.services.parser_service import ParserService
+from app.services.storage_service import storage_service
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,7 @@ class ProcessingAttemptSuperseded(RuntimeError):
 def process_pdf_task(
     task,
     upload_id: str,
-    file_path: str,
+    storage_key: str,
     course_uuid: str,
     course_name: str,
     document_name: str,
@@ -97,11 +98,12 @@ def process_pdf_task(
         try:
             await _ensure_current(superseded)
             await _run_with_session(lambda session: _set_stage(session, ProcessingStage.EXTRACTING))
-            pages = parser_service.extract_pages(file_path)
+            pdf_content = await asyncio.to_thread(storage_service.get_bytes, storage_key)
+            pages = parser_service.extract_pages_from_bytes(pdf_content)
             await _run_with_session(lambda session: _set_stage(session, ProcessingStage.EXTRACTED))
             await _run_with_session(lambda session: _set_stage(session, ProcessingStage.CHUNKING))
             chunks = parser_service.chunk_pages(
-                pages, file_path, course_uuid, upload_id, document_name
+                pages, course_uuid, upload_id, document_name
             )
             if not chunks:
                 raise ValueError(
@@ -132,7 +134,6 @@ def process_pdf_task(
             return {
                 "upload_id": upload_id,
                 "course_id": course_uuid,
-                "file_path": file_path,
                 "status": "ready",
                 **result,
             }
@@ -141,7 +142,6 @@ def process_pdf_task(
             return {
                 "upload_id": upload_id,
                 "course_id": course_uuid,
-                "file_path": file_path,
                 "status": "superseded",
             }
         except Exception as exc:
@@ -170,7 +170,6 @@ def process_pdf_task(
             return {
                 "upload_id": upload_id,
                 "course_id": course_uuid,
-                "file_path": file_path,
                 "status": "failed",
                 "error": message,
             }

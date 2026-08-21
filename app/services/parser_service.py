@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from pathlib import Path
 
 import fitz
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -21,36 +20,9 @@ class ParserService:
             separators=["\n\n", "\n", ". ", " ", ""],
         )
 
-    def extract_text(self, file_path: str) -> str:
-        pdf_path = Path(file_path)
-        if not pdf_path.exists():
-            raise FileNotFoundError(f"PDF file not found: {file_path}")
-
-        page_text: list[str] = []
-        with fitz.open(pdf_path) as document:
-            for page_index, page in enumerate(document, start=1):
-                text = page.get_text("text").strip()
-                if text:
-                    page_text.append(f"[Page {page_index}]\n{text}")
-
-        return "\n\n".join(page_text)
-
-    def parse_and_chunk(
-        self,
-        file_path: str,
-        document_id: str,
-        upload_id: str,
-        document_name: str = "",
-    ) -> list[DocumentChunk]:
-        pages = self.extract_pages(file_path)
-        return self.chunk_pages(pages, file_path, document_id, upload_id, document_name)
-
-    def extract_pages(self, file_path: str) -> list[tuple[int, str]]:
-        pdf_path = Path(file_path)
-        if not pdf_path.exists():
-            raise FileNotFoundError(f"PDF file not found: {file_path}")
+    def extract_pages_from_bytes(self, content: bytes) -> list[tuple[int, str]]:
         pages: list[tuple[int, str]] = []
-        with fitz.open(pdf_path) as document:
+        with fitz.open(stream=content, filetype="pdf") as document:
             for page_index, page in enumerate(document, start=1):
                 text = page.get_text("text").strip()
                 if text:
@@ -60,7 +32,6 @@ class ParserService:
     def chunk_pages(
         self,
         pages: list[tuple[int, str]],
-        file_path: str,
         document_id: str,
         upload_id: str,
         document_name: str = "",
@@ -78,7 +49,6 @@ class ParserService:
                             "document_id": document_id,
                             "upload_id": upload_id,
                             "document_name": document_name,
-                            "source_path": file_path,
                             "page_number": page_index,
                             "section_heading": section_heading or "",
                         }
@@ -97,7 +67,6 @@ class ParserService:
                                 "document_id": document_id,
                                 "upload_id": upload_id,
                                 "document_name": document_name,
-                                "source_path": file_path,
                                 "page_number": page_index,
                                 "section_heading": section_heading or "",
                             },
