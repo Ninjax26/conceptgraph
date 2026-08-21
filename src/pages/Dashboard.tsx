@@ -518,7 +518,10 @@ export default function Dashboard(): JSX.Element {
           ) : null}
 
           {response?.answer ? (
-            <div className="mb-2 flex justify-end">
+            <div className="mb-2 flex items-center justify-between gap-3">
+              <span className={`rounded-full px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wide ${confidenceClass(response.confidence.level)}`}>
+                {response.confidence.level} confidence · {Math.round(response.confidence.score * 100)}%
+              </span>
               <button className="inline-flex items-center gap-1.5 rounded-md border border-slate-200 px-2.5 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50" onClick={() => void copyAnswer()} type="button">
                 {answerCopied ? <Check className="h-3.5 w-3.5 text-teal-600" /> : <Copy className="h-3.5 w-3.5" />}
                 {answerCopied ? "Copied" : "Copy answer"}
@@ -654,14 +657,14 @@ function buildGraphElements(graphContext: GraphContextItem[]): {
       description: item.concept.description,
     });
 
-    item.prerequisites.forEach((prerequisite, prereqIndex) => {
-      const prerequisiteId =
-        prerequisite.id ?? `${conceptId}-prerequisite-${prereqIndex}`;
-      nodes.set(prerequisiteId, {
-        id: prerequisiteId,
-        label: prerequisite.name ?? prerequisiteId,
-        type: prerequisite.type,
-        description: prerequisite.description,
+    (item.related_concepts ?? item.prerequisites).forEach((relatedConcept, relatedIndex) => {
+      const relatedId =
+        relatedConcept.id ?? `${conceptId}-related-${relatedIndex}`;
+      nodes.set(relatedId, {
+        id: relatedId,
+        label: relatedConcept.name ?? relatedId,
+        type: relatedConcept.type,
+        description: relatedConcept.description,
       });
 
     });
@@ -706,6 +709,15 @@ function statusClass(status: UploadStatusResponse["status"]): string {
     cancelled: "bg-slate-100 text-slate-600",
   }[status];
   return `rounded-full px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wide ${tone}`;
+}
+
+function confidenceClass(level: QueryResponse["confidence"]["level"]): string {
+  return {
+    high: "bg-teal-50 text-teal-700",
+    medium: "bg-blue-50 text-blue-700",
+    low: "bg-amber-50 text-amber-700",
+    insufficient: "bg-red-50 text-red-700",
+  }[level];
 }
 
 function friendlyUploadError(message: string | null | undefined): string {

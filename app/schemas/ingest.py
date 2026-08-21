@@ -32,6 +32,7 @@ class UploadStatusResponse(BaseModel):
     retryable: bool = False
     attempt_count: int = 1
     last_attempted_at: datetime | None = None
+    last_heartbeat_at: datetime | None = None
     processed_chunk_count: int = 0
     graph_node_count: int = 0
     graph_edge_count: int = 0

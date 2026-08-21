@@ -33,6 +33,7 @@ export interface GraphRelationship {
 
 export interface GraphContextItem {
   concept: Partial<ConceptNode>;
+  related_concepts: Array<Partial<ConceptNode>>;
   prerequisites: Array<Partial<ConceptNode>>;
   relationships: GraphRelationship[];
 }
@@ -47,6 +48,12 @@ export interface QueryResponse {
     displayed_nodes: number;
     displayed_edges: number;
     filter_reason: string;
+  };
+  confidence: {
+    level: "high" | "medium" | "low" | "insufficient";
+    score: number;
+    evidence_count: number;
+    reason: string;
   };
 }
 
@@ -114,12 +121,27 @@ export interface MockQuestion {
   options: string[];
   correct_answer: string;
   explanation: string;
+  topic: string;
+  sources: ExamSource[];
+}
+
+export interface ExamSource {
+  source_id: string;
+  document_name: string;
+  page_number: number | null;
+  section_heading: string | null;
+  supporting_passage: string;
 }
 
 export interface ExamResponse {
   course_id: string;
   questions: MockQuestion[];
   source_count: number;
+  coverage: {
+    topics?: string[];
+    documents?: string[];
+    pages_by_document?: Record<string, number[]>;
+  };
 }
 
 export async function generateExam(
@@ -182,6 +204,7 @@ export interface UploadStatusResponse {
   retryable: boolean;
   attempt_count: number;
   last_attempted_at?: string | null;
+  last_heartbeat_at?: string | null;
   processed_chunk_count: number;
   graph_node_count: number;
   graph_edge_count: number;

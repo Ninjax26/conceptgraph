@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from functools import lru_cache
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,7 +11,7 @@ from app.core.exceptions import LLMConfigurationError
 from app.services.rag_service import RetrievalService
 from app.services.rerank_service import RerankService
 from app.services.synthesis_service import SynthesisService
-from app.services.citation_service import build_sources
+from app.services.citation_service import assess_evidence, build_sources
 from app.services.course_service import CourseNotFoundError, CourseNotReadyError, CourseService
 from app.core.database import get_postgres_session
 
@@ -27,11 +27,19 @@ class QueryRequest(BaseModel):
     course_id: str = Field(..., min_length=1)
 
 
+class AnswerConfidence(BaseModel):
+    level: Literal["high", "medium", "low", "insufficient"]
+    score: float = Field(ge=0, le=1)
+    evidence_count: int = Field(ge=0)
+    reason: str
+
+
 class QueryResponse(BaseModel):
     answer: str
     sources: list[dict[str, Any]]
     graph_context: list[dict[str, Any]]
     graph_metadata: dict[str, Any]
+    confidence: AnswerConfidence
 
 
 @lru_cache
@@ -55,15 +63,6 @@ async def query_conceptgraph(
     retrieval_service: RetrievalService = Depends(get_retrieval_service),
     db: AsyncSession = Depends(get_postgres_session),
 ) -> QueryResponse:
-    synthesis_service = get_synthesis_service()
-    try:
-        synthesis_service.validate_provider_configured()
-    except LLMConfigurationError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"LLM provider is not configured: {exc}",
-        ) from exc
-
     try:
         course_context = await CourseService().get_ready_context(db, request.course_id)
     except CourseNotFoundError as exc:
@@ -104,12 +103,17 @@ async def query_conceptgraph(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Result ranking is temporarily unavailable. Please try again.",
         ) from exc
-    sources = build_sources(ranked_chunks)
+    evidence_chunks, confidence = assess_evidence(ranked_chunks)
+    sources = build_sources(evidence_chunks)
     if not sources:
-        raise HTTPException(
-            status_code=404,
-            detail="No reliable source passages were found for this question.",
+        return QueryResponse(
+            answer="I could not find enough reliable course content to answer this confidently.",
+            sources=[],
+            graph_context=retrieval_result["graph_context"],
+            graph_metadata=retrieval_result["graph_metadata"],
+            confidence=confidence,
         )
+    synthesis_service = get_synthesis_service()
     try:
         answer = await synthesis_service.synthesize(
             question=request.question,
@@ -133,4 +137,5 @@ async def query_conceptgraph(
         sources=sources,
         graph_context=retrieval_result["graph_context"],
         graph_metadata=retrieval_result["graph_metadata"],
+        confidence=confidence,
     )

@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import desc, select, update
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.processing import FailureCategory, MAX_PROCESSING_ATTEMPTS, ProcessingStage
@@ -23,6 +23,7 @@ class UploadService:
         original_filename: str,
         stored_file_path: str,
     ) -> DocumentUpload:
+        now = datetime.now(timezone.utc)
         record = DocumentUpload(
             upload_id=upload_id,
             task_id=task_id,
@@ -38,13 +39,15 @@ class UploadService:
             stage=ProcessingStage.UPLOADED.value,
             retryable=False,
             attempt_count=1,
-            last_attempted_at=datetime.now(timezone.utc),
+            last_attempted_at=now,
+            last_heartbeat_at=now,
         )
         session.add(record)
         session.add(
             ProcessingAttempt(
                 id=str(uuid4()), document_id=upload_id, task_id=task_id,
                 attempt_number=1, stage=ProcessingStage.UPLOADED.value,
+                last_heartbeat_at=now,
             )
         )
         await session.commit()
@@ -92,21 +95,31 @@ class UploadService:
 
     async def expire_stale_uploads(self, session: AsyncSession) -> None:
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
-        await session.execute(
-            update(DocumentUpload)
+        result = await session.execute(
+            select(DocumentUpload)
             .where(
                 DocumentUpload.status == "active",
-                DocumentUpload.updated_at < cutoff,
-            )
-            .values(
-                status="failed",
-                stage=ProcessingStage.FAILED.value,
-                failure_category=FailureCategory.WORKER_ERROR.value,
-                retryable=DocumentUpload.attempt_count < MAX_PROCESSING_ATTEMPTS,
-                error_message="Processing was interrupted. Please retry this document.",
-                completed_at=datetime.now(timezone.utc),
+                func.coalesce(
+                    DocumentUpload.last_heartbeat_at,
+                    DocumentUpload.updated_at,
+                ) < cutoff,
             )
         )
+        now = datetime.now(timezone.utc)
+        for record in result.scalars().all():
+            record.status = "failed"
+            record.stage = ProcessingStage.FAILED.value
+            record.failure_category = FailureCategory.WORKER_ERROR.value
+            record.retryable = record.attempt_count < MAX_PROCESSING_ATTEMPTS
+            record.error_message = "Processing was interrupted. Please retry this document."
+            record.completed_at = now
+            attempt = await self._current_attempt(session, record)
+            if attempt is not None:
+                attempt.stage = ProcessingStage.FAILED.value
+                attempt.failure_category = FailureCategory.WORKER_ERROR.value
+                attempt.retryable = record.retryable
+                attempt.error_message = record.error_message
+                attempt.completed_at = now
         await session.commit()
 
     async def retry_upload(
@@ -137,12 +150,14 @@ class UploadService:
         record.retryable = False
         record.attempt_count += 1
         record.last_attempted_at = datetime.now(timezone.utc)
+        record.last_heartbeat_at = record.last_attempted_at
         record.started_at = None
         record.completed_at = None
         session.add(
             ProcessingAttempt(
                 id=str(uuid4()), document_id=record.upload_id, task_id=task_id,
                 attempt_number=record.attempt_count, stage=ProcessingStage.UPLOADED.value,
+                last_heartbeat_at=record.last_heartbeat_at,
             )
         )
         await session.commit()
@@ -161,31 +176,54 @@ class UploadService:
         self,
         session: AsyncSession,
         upload_id: str,
+        task_id: str,
         stage: ProcessingStage,
-    ) -> None:
-        record = await self.get_upload(session, upload_id)
-        if record is None:
-            return
+    ) -> bool:
+        record = await self._get_current_upload(session, upload_id, task_id)
+        if record is None or record.status != "active":
+            return False
+        now = datetime.now(timezone.utc)
         record.stage = stage.value
         record.status = "active" if stage != ProcessingStage.READY else "ready"
+        record.last_heartbeat_at = now
         if record.started_at is None:
-            record.started_at = datetime.now(timezone.utc)
+            record.started_at = now
         attempt = await self._current_attempt(session, record)
         if attempt is not None:
             attempt.stage = stage.value
             if attempt.started_at is None:
                 attempt.started_at = record.started_at
+            attempt.last_heartbeat_at = now
         await session.commit()
+        return True
+
+    async def heartbeat(
+        self,
+        session: AsyncSession,
+        upload_id: str,
+        task_id: str,
+    ) -> bool:
+        record = await self._get_current_upload(session, upload_id, task_id)
+        if record is None or record.status != "active":
+            return False
+        now = datetime.now(timezone.utc)
+        record.last_heartbeat_at = now
+        attempt = await self._current_attempt(session, record)
+        if attempt is not None:
+            attempt.last_heartbeat_at = now
+        await session.commit()
+        return True
 
     async def mark_completed(
         self,
         session: AsyncSession,
         upload_id: str,
+        task_id: str,
         result_json: dict[str, Any],
-    ) -> None:
-        record = await self.get_upload(session, upload_id)
-        if record is None:
-            return
+    ) -> bool:
+        record = await self._get_current_upload(session, upload_id, task_id)
+        if record is None or record.status != "active":
+            return False
         record.status = "ready"
         record.stage = ProcessingStage.READY.value
         record.result_json = result_json
@@ -196,29 +234,34 @@ class UploadService:
         record.error_message = None
         record.failure_category = None
         record.retryable = False
+        record.last_heartbeat_at = record.completed_at
         attempt = await self._current_attempt(session, record)
         if attempt is not None:
             attempt.stage = ProcessingStage.READY.value
             attempt.completed_at = record.completed_at
+            attempt.last_heartbeat_at = record.completed_at
         await session.commit()
+        return True
 
     async def mark_failed(
         self,
         session: AsyncSession,
         upload_id: str,
+        task_id: str,
         error_message: str,
         category: FailureCategory = FailureCategory.UNKNOWN_ERROR,
         retryable: bool = False,
-    ) -> None:
-        record = await self.get_upload(session, upload_id)
-        if record is None:
-            return
+    ) -> bool:
+        record = await self._get_current_upload(session, upload_id, task_id)
+        if record is None or record.status != "active":
+            return False
         record.status = "failed"
         record.stage = ProcessingStage.FAILED.value
         record.error_message = error_message
         record.failure_category = category.value
         record.retryable = retryable and record.attempt_count < MAX_PROCESSING_ATTEMPTS
         record.completed_at = datetime.now(timezone.utc)
+        record.last_heartbeat_at = record.completed_at
         attempt = await self._current_attempt(session, record)
         if attempt is not None:
             attempt.stage = ProcessingStage.FAILED.value
@@ -226,7 +269,23 @@ class UploadService:
             attempt.retryable = record.retryable
             attempt.error_message = error_message
             attempt.completed_at = record.completed_at
+            attempt.last_heartbeat_at = record.completed_at
         await session.commit()
+        return True
+
+    async def _get_current_upload(
+        self,
+        session: AsyncSession,
+        upload_id: str,
+        task_id: str,
+    ) -> DocumentUpload | None:
+        result = await session.execute(
+            select(DocumentUpload).where(
+                DocumentUpload.upload_id == upload_id,
+                DocumentUpload.task_id == task_id,
+            )
+        )
+        return result.scalar_one_or_none()
 
     async def _current_attempt(
         self, session: AsyncSession, record: DocumentUpload

@@ -64,7 +64,7 @@ async def get_db() -> AsyncGenerator[DatabaseClients, None]:
 
 async def initialize_database_schema() -> None:
     async with postgres_engine.begin() as conn:
-        await conn.run_sync(lambda sync_conn: Base.metadata.tables["courses"].create(sync_conn, checkfirst=True))
+        await conn.run_sync(Base.metadata.create_all)
         migrations = [
             "ALTER TABLE document_uploads ADD COLUMN IF NOT EXISTS course_uuid VARCHAR(64)",
             "ALTER TABLE document_uploads ADD COLUMN IF NOT EXISTS content_hash VARCHAR(64)",
@@ -73,16 +73,17 @@ async def initialize_database_schema() -> None:
             "ALTER TABLE document_uploads ADD COLUMN IF NOT EXISTS retryable BOOLEAN NOT NULL DEFAULT FALSE",
             "ALTER TABLE document_uploads ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE document_uploads ADD COLUMN IF NOT EXISTS last_attempted_at TIMESTAMPTZ",
+            "ALTER TABLE document_uploads ADD COLUMN IF NOT EXISTS last_heartbeat_at TIMESTAMPTZ",
             "ALTER TABLE document_uploads ADD COLUMN IF NOT EXISTS processed_chunk_count INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE document_uploads ADD COLUMN IF NOT EXISTS graph_node_count INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE document_uploads ADD COLUMN IF NOT EXISTS graph_edge_count INTEGER NOT NULL DEFAULT 0",
             "CREATE INDEX IF NOT EXISTS ix_document_uploads_course_uuid ON document_uploads (course_uuid)",
             "CREATE INDEX IF NOT EXISTS ix_document_uploads_content_hash ON document_uploads (content_hash)",
             "CREATE INDEX IF NOT EXISTS ix_document_uploads_stage ON document_uploads (stage)",
+            "ALTER TABLE processing_attempts ADD COLUMN IF NOT EXISTS last_heartbeat_at TIMESTAMPTZ",
         ]
         for statement in migrations:
             await conn.execute(text(statement))
-        await conn.run_sync(Base.metadata.create_all)
         await _migrate_legacy_uploads(conn)
 
 

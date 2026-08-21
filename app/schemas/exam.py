@@ -9,6 +9,16 @@ from typing import Annotated
 from pydantic import BaseModel, ConfigDict, Field, StrictStr, model_validator
 
 
+class ExamSource(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    source_id: Annotated[StrictStr, Field(min_length=1)]
+    document_name: Annotated[StrictStr, Field(min_length=1)]
+    page_number: int | None = Field(default=None, ge=1)
+    section_heading: str | None = None
+    supporting_passage: Annotated[StrictStr, Field(min_length=1)]
+
+
 class MockQuestion(BaseModel):
     """A single multiple-choice question produced by the exam generator."""
 
@@ -30,6 +40,8 @@ class MockQuestion(BaseModel):
             description="Explanation citing why the answer is correct based on the syllabus content.",
         ),
     ]
+    topic: Annotated[StrictStr, Field(min_length=1)]
+    sources: Annotated[list[ExamSource], Field(min_length=1)]
 
     @model_validator(mode="after")
     def correct_answer_must_match_an_option(self) -> "MockQuestion":
@@ -49,3 +61,4 @@ class ExamResponse(BaseModel):
     course_id: Annotated[StrictStr, Field(min_length=1)]
     questions: list[MockQuestion] = Field(default_factory=list)
     source_count: int = Field(default=0, ge=0)
+    coverage: dict[str, list[str] | dict[str, list[int]]] = Field(default_factory=dict)

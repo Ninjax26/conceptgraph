@@ -37,6 +37,7 @@ class DocumentUpload(Base):
     retryable: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     last_attempted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     processed_chunk_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     graph_node_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     graph_edge_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -71,4 +72,5 @@ class ProcessingAttempt(Base):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)

@@ -105,9 +105,9 @@ class RetrievalService:
         displayed_edge_ids: set[tuple[str, str, str]] = set()
         for record in records:
             concept = self._node_to_dict(record.get("concept"))
-            prerequisites = [
+            related_concepts = [
                 self._node_to_dict(node)
-                for node in record.get("prerequisites", [])
+                for node in record.get("related_concepts", [])
                 if node is not None
             ]
             relationships = [
@@ -117,12 +117,22 @@ class RetrievalService:
             ]
             concepts.append({
                 "concept": concept,
-                "prerequisites": prerequisites,
+                "related_concepts": related_concepts,
+                "prerequisites": [
+                    node
+                    for node in related_concepts
+                    if any(
+                        relationship.get("type") == "PREREQUISITE_OF"
+                        and relationship.get("source") == node.get("id")
+                        and relationship.get("target") == concept.get("id")
+                        for relationship in relationships
+                    )
+                ],
                 "relationships": relationships,
             })
             names_by_id = {
                 str(node.get("id")): str(node.get("name"))
-                for node in prerequisites
+                for node in related_concepts
                 if node.get("id") and node.get("name")
             }
             for relationship in relationships:
@@ -132,7 +142,10 @@ class RetrievalService:
                     str(relationship.get("type", "")),
                 )
                 displayed_edge_ids.add(edge_id)
-                if relationship.get("type") == "PREREQUISITE_OF":
+                if (
+                    relationship.get("type") == "PREREQUISITE_OF"
+                    and relationship.get("target") == concept.get("id")
+                ):
                     prerequisite_name = names_by_id.get(str(relationship.get("source", "")))
                     if prerequisite_name:
                         prerequisite_names.append(prerequisite_name)
@@ -146,7 +159,7 @@ class RetrievalService:
                 "displayed_nodes": len({
                     node.get("id")
                     for item in concepts
-                    for node in [item["concept"], *item["prerequisites"]]
+                    for node in [item["concept"], *item["related_concepts"]]
                     if node.get("id")
                 }),
                 "displayed_edges": len(displayed_edge_ids),
@@ -322,8 +335,8 @@ class RetrievalService:
             "(:Concept {id, name, type, description}) nodes by [:CONTAINS]. "
             "Always scope the query to MATCH (course:Course {id: $course_id}) and only "
             "return only concepts contained by that course. "
-            "The query must return a variable named concept and a variable named prerequisites. "
-            "prerequisites must contain prerequisite Concept nodes up to 2 hops away. "
+            "The query must return a variable named concept and a variable named related_concepts. "
+            "related_concepts must contain adjacent Concept nodes with relationship direction preserved. "
             "Use parameters instead of interpolating user text. Do not write, merge, delete, "
             "create, set, call procedures, or use APOC. Return only JSON matching this schema:\n\n"
             f"{schema}"
@@ -342,9 +355,9 @@ class RetrievalService:
             WHERE course.id IN $course_ids
               AND concept.upload_id IN $document_ids
               AND any(term IN $terms WHERE toLower(concept.name) CONTAINS term)
-            OPTIONAL MATCH (prerequisite:Concept)-[relationship]->(concept)
-            WHERE prerequisite IS NULL OR ((course)-[:CONTAINS]->(prerequisite) AND prerequisite.upload_id IN $document_ids)
-            RETURN concept, collect(DISTINCT prerequisite) AS prerequisites,
+            OPTIONAL MATCH (concept)-[relationship]-(related:Concept)
+            WHERE related IS NULL OR ((course)-[:CONTAINS]->(related) AND related.upload_id IN $document_ids)
+            RETURN concept, collect(DISTINCT related) AS related_concepts,
                    collect(DISTINCT relationship) AS relationships
             LIMIT 5
             """,
@@ -360,8 +373,8 @@ class RetrievalService:
         )
         if forbidden.search(stripped):
             raise ValueError("Generated Cypher contains a forbidden write operation.")
-        if "concept" not in stripped or "prerequisites" not in stripped:
-            raise ValueError("Generated Cypher must return concept and prerequisites.")
+        if "concept" not in stripped or "related_concepts" not in stripped:
+            raise ValueError("Generated Cypher must return concept and related_concepts.")
         return stripped
 
     @staticmethod
@@ -399,9 +412,9 @@ class RetrievalService:
             MATCH (course:Course)-[:CONTAINS]->(concept:Concept)
             WHERE course.id IN $course_ids
               AND concept.upload_id IN $document_ids
-            OPTIONAL MATCH (prerequisite:Concept)-[relationship]->(concept)
-            WHERE prerequisite IS NULL OR ((course)-[:CONTAINS]->(prerequisite) AND prerequisite.upload_id IN $document_ids)
-            RETURN concept, collect(DISTINCT prerequisite) AS prerequisites,
+            OPTIONAL MATCH (concept)-[relationship]-(related:Concept)
+            WHERE related IS NULL OR ((course)-[:CONTAINS]->(related) AND related.upload_id IN $document_ids)
+            RETURN concept, collect(DISTINCT related) AS related_concepts,
                    collect(DISTINCT relationship) AS relationships
             ORDER BY concept.name
             LIMIT 50

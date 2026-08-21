@@ -11,6 +11,7 @@ import logging
 from typing import Any
 
 from groq import Groq
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import UnexpectedResponse
 from qdrant_client.models import FieldCondition, Filter, MatchAny
@@ -18,10 +19,33 @@ from qdrant_client.models import FieldCondition, Filter, MatchAny
 from app.core.config import settings
 from app.core.database import qdrant_client as default_qdrant_client
 from app.core.exceptions import LLMConfigurationError
-from app.schemas.exam import ExamResponse, MockQuestion
+from app.schemas.exam import ExamResponse, ExamSource, MockQuestion
 from app.services.course_service import ReadyCourseContext
 
 logger = logging.getLogger(__name__)
+
+
+class GeneratedQuestion(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    question_text: str = Field(min_length=1)
+    options: list[str] = Field(min_length=4, max_length=4)
+    correct_answer: str = Field(min_length=1)
+    explanation: str = Field(min_length=1)
+    topic: str = Field(min_length=1)
+    citation_ids: list[str] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_answer(self) -> "GeneratedQuestion":
+        if self.correct_answer not in self.options:
+            raise ValueError("correct_answer must exactly match one option.")
+        return self
+
+
+class GeneratedExam(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    questions: list[GeneratedQuestion] = Field(default_factory=list)
 
 
 class ExamService:
@@ -65,23 +89,32 @@ class ExamService:
                 course_id=context.course.id,
                 questions=[],
                 source_count=0,
+                coverage={},
             )
 
         # Step 2 – constrained generation
-        context_text = self._build_context(chunks)
+        exam_sources = self._select_exam_sources(chunks)
+        context_text = self._build_context(exam_sources)
         questions = await self._generate_questions(
             context_text=context_text,
             num_questions=num_questions,
+            sources=exam_sources,
         )
         if len(questions) != num_questions:
             raise RuntimeError(
                 f"Exam generation produced {len(questions)} valid questions; expected {num_questions}."
             )
 
+        used_source_ids = {
+            source.source_id
+            for question in questions
+            for source in question.sources
+        }
         return ExamResponse(
             course_id=context.course.id,
             questions=questions,
-            source_count=min(6, len(chunks)),
+            source_count=len(used_source_ids),
+            coverage=self._build_coverage(questions),
         )
 
     # ------------------------------------------------------------------
@@ -205,16 +238,17 @@ class ExamService:
         self,
         context_text: str,
         num_questions: int,
+        sources: list[ExamSource],
     ) -> list[MockQuestion]:
         """Dispatch to the configured LLM provider."""
         provider = settings.llm_provider.lower()
         if provider == "gemini":
             return await asyncio.to_thread(
-                self._generate_with_gemini, context_text, num_questions,
+                self._generate_with_gemini, context_text, num_questions, sources,
             )
         if provider == "groq":
             return await asyncio.to_thread(
-                self._generate_with_groq, context_text, num_questions,
+                self._generate_with_groq, context_text, num_questions, sources,
             )
         raise ValueError(f"Unsupported LLM_PROVIDER: {settings.llm_provider}")
 
@@ -222,6 +256,7 @@ class ExamService:
         self,
         context_text: str,
         num_questions: int,
+        sources: list[ExamSource],
     ) -> list[MockQuestion]:
         if not settings.groq_api_key:
             raise LLMConfigurationError("GROQ_API_KEY is required when LLM_PROVIDER=groq")
@@ -238,12 +273,13 @@ class ExamService:
         )
 
         raw = completion.choices[0].message.content or "{}"
-        return self._parse_questions(raw)
+        return self._parse_questions(raw, sources)
 
     def _generate_with_gemini(
         self,
         context_text: str,
         num_questions: int,
+        sources: list[ExamSource],
     ) -> list[MockQuestion]:
         if not settings.gemini_api_key:
             raise LLMConfigurationError("GEMINI_API_KEY is required when LLM_PROVIDER=gemini")
@@ -262,7 +298,7 @@ class ExamService:
                 "response_mime_type": "application/json",
             },
         )
-        return self._parse_questions(response.text or "{}")
+        return self._parse_questions(response.text or "{}", sources)
 
     # ------------------------------------------------------------------
     # Prompt construction
@@ -270,7 +306,7 @@ class ExamService:
 
     @staticmethod
     def _system_prompt(num_questions: int) -> str:
-        schema = json.dumps(ExamResponse.model_json_schema(), indent=2)
+        schema = json.dumps(GeneratedExam.model_json_schema(), indent=2)
         return (
             "You are ConceptGraph Exam Generator – a syllabus-bounded academic "
             "assessment engine. Your ONLY job is to produce a strict JSON exam.\n\n"
@@ -282,7 +318,10 @@ class ExamService:
             "4. The 'correct_answer' field must be one of the 4 options verbatim.\n"
             "5. The 'explanation' must cite specific information from the provided "
             "context that justifies the correct answer.\n"
-            "6. Output ONLY a JSON object with a single key 'questions' containing "
+            "6. Include a concise topic and one or more citation_ids copied exactly from "
+            "the provided [Exam Source ...] labels. Never invent a citation ID.\n"
+            "7. Spread questions across distinct topics and documents when the context permits.\n"
+            "8. Output ONLY a JSON object with a single key 'questions' containing "
             "the list of question objects.\n\n"
             f"Response JSON schema:\n{schema}"
         )
@@ -302,23 +341,118 @@ class ExamService:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _build_context(chunks: list[dict[str, Any]]) -> str:
-        """Build a representative context that stays within provider limits."""
-        if not chunks:
+    def _build_context(sources: list[ExamSource]) -> str:
+        if not sources:
             return ""
-        sample_count = min(6, len(chunks))
-        sample_indexes = {
-            round(index * (len(chunks) - 1) / max(sample_count - 1, 1))
-            for index in range(sample_count)
-        }
         return "\n\n".join(
-            f"[Course excerpt {index + 1}]\n{str(chunks[index].get('text', ''))[:600]}"
-            for index in sorted(sample_indexes)
-            if chunks[index].get("text")
+            f"[Exam Source {source.source_id}] | {source.document_name} | "
+            f"page {source.page_number or 'unknown'} | "
+            f"section {source.section_heading or 'unknown'}\n"
+            f"{source.supporting_passage}"
+            for source in sources
         )
 
     @staticmethod
-    def _parse_questions(raw_json: str) -> list[MockQuestion]:
+    def _select_exam_sources(
+        chunks: list[dict[str, Any]],
+        limit: int = 12,
+    ) -> list[ExamSource]:
+        groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        seen: set[tuple[str, int | None, str]] = set()
+        for chunk in chunks:
+            metadata = chunk.get("metadata") or {}
+            passage = " ".join(str(chunk.get("text", "")).split())
+            if not passage:
+                continue
+            document_name = str(metadata.get("document_name") or "Course PDF")
+            page = (
+                metadata.get("page_number")
+                if isinstance(metadata.get("page_number"), int)
+                else None
+            )
+            heading = str(metadata.get("section_heading") or "").strip()
+            dedupe_key = (document_name, page, passage[:240])
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            topic_key = heading.casefold() if heading else f"page-{page or 'unknown'}"
+            groups.setdefault((document_name, topic_key), []).append(chunk)
+
+        ordered_groups = [
+            sorted(
+                group,
+                key=lambda item: (
+                    int((item.get("metadata") or {}).get("page_number") or 0),
+                    int((item.get("metadata") or {}).get("chunk_index") or 0),
+                ),
+            )
+            for _, group in sorted(groups.items())
+        ]
+        selected: list[dict[str, Any]] = []
+        while ordered_groups and len(selected) < limit:
+            remaining: list[list[dict[str, Any]]] = []
+            for group in ordered_groups:
+                if len(selected) >= limit:
+                    break
+                selected.append(group.pop(0))
+                if group:
+                    remaining.append(group)
+            ordered_groups = remaining
+
+        sources: list[ExamSource] = []
+        for index, chunk in enumerate(selected, start=1):
+            metadata = chunk.get("metadata") or {}
+            page = (
+                metadata.get("page_number")
+                if isinstance(metadata.get("page_number"), int)
+                else None
+            )
+            sources.append(
+                ExamSource(
+                    source_id=f"exam-source-{index}",
+                    document_name=str(metadata.get("document_name") or "Course PDF"),
+                    page_number=page,
+                    section_heading=str(metadata.get("section_heading") or "") or None,
+                    supporting_passage=" ".join(
+                        str(chunk.get("text", "")).split()
+                    )[:900],
+                )
+            )
+        return sources
+
+    @staticmethod
+    def _build_coverage(
+        questions: list[MockQuestion],
+    ) -> dict[str, list[str] | dict[str, list[int]]]:
+        topics = sorted({question.topic for question in questions})
+        documents = sorted(
+            {
+                source.document_name
+                for question in questions
+                for source in question.sources
+            }
+        )
+        pages_by_document: dict[str, list[int]] = {}
+        for question in questions:
+            for source in question.sources:
+                if source.page_number is not None:
+                    pages_by_document.setdefault(source.document_name, []).append(
+                        source.page_number
+                    )
+        return {
+            "topics": topics,
+            "documents": documents,
+            "pages_by_document": {
+                document: sorted(set(pages))
+                for document, pages in pages_by_document.items()
+            },
+        }
+
+    @staticmethod
+    def _parse_questions(
+        raw_json: str,
+        sources: list[ExamSource],
+    ) -> list[MockQuestion]:
         """Parse LLM JSON output into validated MockQuestion objects."""
         try:
             data = json.loads(raw_json)
@@ -326,20 +460,34 @@ class ExamService:
             logger.error("LLM returned invalid JSON: %s", exc)
             raise RuntimeError("LLM returned invalid exam JSON.") from exc
 
-        # The LLM may return {"questions": [...]} or just [...]
-        question_dicts: list[dict[str, Any]]
         if isinstance(data, list):
-            question_dicts = data
-        elif isinstance(data, dict):
-            question_dicts = data.get("questions", [])
-        else:
-            logger.error("Unexpected LLM response structure: %s", type(data))
-            raise RuntimeError("LLM returned an unexpected exam JSON structure.")
+            data = {"questions": data}
+        try:
+            generated = GeneratedExam.model_validate(data)
+        except Exception as exc:
+            raise RuntimeError("LLM returned an unexpected exam JSON structure.") from exc
 
+        sources_by_id = {source.source_id: source for source in sources}
         questions: list[MockQuestion] = []
-        for item in question_dicts:
+        for item in generated.questions:
             try:
-                questions.append(MockQuestion.model_validate(item))
+                cited_sources = [
+                    sources_by_id[source_id]
+                    for source_id in dict.fromkeys(item.citation_ids)
+                    if source_id in sources_by_id
+                ]
+                if not cited_sources:
+                    raise ValueError("Question did not cite a valid exam source.")
+                questions.append(
+                    MockQuestion(
+                        question_text=item.question_text,
+                        options=item.options,
+                        correct_answer=item.correct_answer,
+                        explanation=item.explanation,
+                        topic=item.topic,
+                        sources=cited_sources,
+                    )
+                )
             except Exception as exc:
                 logger.warning("Skipping malformed question: %s", exc)
                 continue

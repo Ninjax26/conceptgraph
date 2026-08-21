@@ -9,10 +9,13 @@ from unittest.mock import ANY, AsyncMock, patch
 from fastapi import HTTPException
 
 from app.api.endpoints import ingest
-from app.core.processing import FailureCategory, classify_failure, normalize_course_name
-from app.services.citation_service import build_sources
+from app.core.processing import FailureCategory, ProcessingStage, classify_failure, normalize_course_name
+from app.services.citation_service import assess_evidence, build_sources
 from app.services.course_service import CourseNotReadyError, CourseService
+from app.services.exam_service import ExamService
 from app.services.rag_service import RetrievalService
+from app.services.upload_service import UploadService
+from app.schemas.exam import ExamSource
 from app.schemas.extraction import ConceptNode, ConceptRelationship, GraphExtractionResponse
 from pydantic import ValidationError
 
@@ -97,6 +100,112 @@ class ProcessingRulesTests(unittest.TestCase):
         self.assertEqual(serialized["source"], "source")
         self.assertEqual(serialized["target"], "target")
         self.assertEqual(serialized["document_name"], "Course.pdf")
+
+    def test_bidirectional_graph_query_preserves_native_edge_direction(self):
+        generated = RetrievalService._fallback_cypher("zero trust")
+
+        self.assertIn("(concept)-[relationship]-(related:Concept)", generated.cypher)
+        self.assertIn("related_concepts", generated.cypher)
+
+    def test_evidence_threshold_removes_irrelevant_passages(self):
+        relevant = {
+            "text": "Strongly relevant passage",
+            "score": 0.82,
+            "rerank_score": 5.0,
+            "metadata": {},
+        }
+        irrelevant = {
+            "text": "Unrelated passage",
+            "score": 0.05,
+            "rerank_score": -10.0,
+            "metadata": {},
+        }
+
+        chunks, confidence = assess_evidence([irrelevant, relevant])
+
+        self.assertEqual([chunk["text"] for chunk in chunks], [relevant["text"]])
+        self.assertEqual(confidence["evidence_count"], 1)
+        self.assertIn(confidence["level"], {"medium", "low"})
+
+    def test_exam_sources_are_balanced_and_citations_are_enriched(self):
+        chunks = [
+            {
+                "text": "Alpha evidence",
+                "metadata": {
+                    "document_name": "A.pdf",
+                    "page_number": 1,
+                    "section_heading": "Alpha",
+                    "chunk_index": 0,
+                },
+            },
+            {
+                "text": "Beta evidence",
+                "metadata": {
+                    "document_name": "B.pdf",
+                    "page_number": 4,
+                    "section_heading": "Beta",
+                    "chunk_index": 0,
+                },
+            },
+        ]
+        sources = ExamService._select_exam_sources(chunks)
+        raw = """{
+          "questions": [{
+            "question_text": "Which statement is supported?",
+            "options": ["Alpha", "One", "Two", "Three"],
+            "correct_answer": "Alpha",
+            "explanation": "Alpha is supported by the cited passage.",
+            "topic": "Alpha",
+            "citation_ids": ["exam-source-1"]
+          }]
+        }"""
+
+        questions = ExamService._parse_questions(raw, sources)
+
+        self.assertEqual({source.document_name for source in sources}, {"A.pdf", "B.pdf"})
+        self.assertEqual(questions[0].sources[0].source_id, "exam-source-1")
+        self.assertTrue(questions[0].sources[0].supporting_passage)
+
+    def test_exam_question_without_valid_citation_is_rejected(self):
+        source = ExamSource(
+            source_id="exam-source-1",
+            document_name="Course.pdf",
+            page_number=1,
+            supporting_passage="Evidence",
+        )
+        raw = """{
+          "questions": [{
+            "question_text": "Unsupported?",
+            "options": ["A", "B", "C", "D"],
+            "correct_answer": "A",
+            "explanation": "No valid citation.",
+            "topic": "Test",
+            "citation_ids": ["invented-source"]
+          }]
+        }"""
+
+        self.assertEqual(ExamService._parse_questions(raw, [source]), [])
+
+
+class ProcessingFencingTests(unittest.TestCase):
+    def test_stale_or_failed_attempt_cannot_advance_stage(self):
+        service = UploadService()
+        service._get_current_upload = AsyncMock(
+            return_value=SimpleNamespace(status="failed")
+        )
+        session = SimpleNamespace(commit=AsyncMock())
+
+        updated = asyncio.run(
+            service.set_stage(
+                session,
+                "upload-1",
+                "stale-task",
+                ProcessingStage.EMBEDDING,
+            )
+        )
+
+        self.assertFalse(updated)
+        session.commit.assert_not_awaited()
 
 
 class ReadyContextTests(unittest.TestCase):
@@ -189,6 +298,7 @@ class RetryEndpointTests(unittest.TestCase):
             mark_failed.assert_awaited_once_with(
                 ANY,
                 record.upload_id,
+                ANY,
                 "The processing worker is unavailable. Please retry when the service is restored.",
                 FailureCategory.WORKER_ERROR,
                 True,

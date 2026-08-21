@@ -171,6 +171,7 @@ Open the app at `http://127.0.0.1:5173`.
 - Query and exam generation call the same READY-course resolver and filter Qdrant by READY document IDs.
 - Graph nodes and relationships carry document provenance (`upload_id` and document name). Legacy graph data without provenance is excluded from query graph counts.
 - Failed attempts are retained in `processing_attempts`; retries update the original document and are capped at three attempts.
+- Workers persist 30-second heartbeats and every worker-driven transition is fenced by the current Celery task ID. Superseded attempts stop without changing status or deleting current-attempt data.
 - Course selection comes from `GET /api/v1/ingest/courses`, not the truncated processing queue. Courses without READY content remain visible but cannot be selected for query or exam generation.
 - The dashboard remembers the course associated with a new upload, refreshes course summaries when polling observes READY, and automatically selects that course. On a fresh page load it selects the most recently updated READY course. Changing courses clears the previous answer and concept map.
 
@@ -183,7 +184,7 @@ Open the app at `http://127.0.0.1:5173`.
 | Build graph | Representative text | Neo4j concepts/relationships with document provenance | Graph transaction completes | Provider or graph database failure |
 | Commit READY | Stored counts | `document_uploads` + `processing_attempts` | All mandatory writes committed | Compensating cleanup and `FAILED` |
 | Query | Course name/UUID + question | Ranked sources, answer, query subgraph | Shared READY context and usable vectors | `404` unknown course, `409` no usable READY data |
-| Exam | Course name/UUID + question count | Validated questions + source count | Same READY context and usable vectors | Same `404`/`409` readiness rules as query |
+| Exam | Course name/UUID + question count | Topic-balanced questions with document/page/passage citations | Same READY context, usable vectors, and valid source IDs | Same `404`/`409` readiness rules as query |
 | Dashboard | Upload/status/query responses | Grouped queue, citations, graph metadata | Stable typed API contract | Safe actionable error state |
 
 ### Processing States
@@ -203,10 +204,11 @@ Failure categories are `DOCUMENT_ERROR`, `CONFIGURATION_ERROR`, `PROVIDER_ERROR`
 
 1. The user asks a question.
 2. FastAPI runs a deterministic, parameterized, read-only Cypher query scoped to READY documents.
-3. Neo4j returns matching concepts and typed incoming relationships.
+3. Neo4j returns matching concepts plus typed incoming and outgoing relationships with native direction.
 4. Those prerequisite names expand the vector query sent to Qdrant.
 5. A local cross-encoder reranks the chunks.
-6. The synthesis model answers strictly from the provided context.
+6. A configurable evidence gate removes weak passages and calculates answer confidence.
+7. The synthesis model answers strictly from the provided context, or returns the weak-evidence fallback without calling the LLM.
 
 Answers use readable citations such as `[Source 1]` and `[Source 2, p. 6]`. Internal chunk IDs, vector IDs, file paths, and scores are never included in model prompts or displayed answers. Source cards include the PDF name, page, detected section heading, and supporting passage.
 
@@ -217,8 +219,12 @@ Neo4j retrieval preserves native records instead of using the driver's lossy `Re
 ### Exam Generation
 
 1. The user selects a course.
-2. Qdrant is filtered by `course_id`.
-3. The LLM generates a syllabus-bounded mock exam.
+2. Qdrant is filtered by READY document IDs.
+3. Up to twelve excerpts are selected round-robin across document/topic groups.
+4. The LLM must assign a topic and cite one or more provided source IDs for every question.
+5. The backend rejects invented source IDs and enriches valid citations with document, page, heading, and supporting passage metadata.
+
+Evidence thresholds are configurable with `EVIDENCE_MIN_SCORE`, `EVIDENCE_MEDIUM_SCORE`, and `EVIDENCE_HIGH_SCORE`. They must be ordered from lowest to highest and remain between zero and one.
 
 ## API Endpoints
 
@@ -232,6 +238,29 @@ Neo4j retrieval preserves native records instead of using the driver's lossy `Re
 - `POST /api/v1/query`
 - `POST /api/v1/exam/generate`
 - `GET /api/v1/health`
+
+## Application Containers
+
+The repository includes separate production-oriented images for the application runtime and static frontend. The API and Celery worker intentionally share one Python image so they use identical code and dependencies.
+
+```bash
+# FastAPI image
+docker build -f Dockerfile.api -t conceptgraph-api .
+
+# Run the same image as a Celery worker
+docker run --rm conceptgraph-api \
+  celery -A app.tasks.document_tasks.celery_app worker \
+  --loglevel=info --concurrency=1
+
+# Frontend image; the API URL is compiled into the Vite bundle
+docker build -f Dockerfile.frontend \
+  --build-arg VITE_API_BASE_URL=https://api.example.com/api/v1 \
+  -t conceptgraph-frontend .
+```
+
+`Dockerfile.api` runs as the non-root `conceptgraph` user and exposes port `8000`. `Dockerfile.frontend` uses a multi-stage Node build and serves the compiled SPA from unprivileged Nginx on port `8080`; its Nginx configuration includes `/dashboard` fallback routing and `/healthz`.
+
+The current upload pipeline still requires the API and worker to share `data/uploads`. For a multi-instance cloud deployment, replace that path contract with object storage before scaling the services independently.
 
 Query and exam responses use the same course readiness rules:
 

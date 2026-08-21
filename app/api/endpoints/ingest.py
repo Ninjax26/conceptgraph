@@ -113,6 +113,7 @@ async def upload_document(
         await upload_service.mark_failed(
             db,
             upload_id,
+            task_id,
             "The processing worker is unavailable. Please retry when the service is restored.",
             FailureCategory.WORKER_ERROR,
             True,
@@ -154,6 +155,7 @@ async def get_upload_status(
         retryable=record.retryable,
         attempt_count=record.attempt_count,
         last_attempted_at=record.last_attempted_at,
+        last_heartbeat_at=record.last_heartbeat_at,
         processed_chunk_count=record.processed_chunk_count,
         graph_node_count=record.graph_node_count,
         graph_edge_count=record.graph_edge_count,
@@ -195,6 +197,7 @@ async def list_uploads(
             retryable=record.retryable,
             attempt_count=record.attempt_count,
             last_attempted_at=record.last_attempted_at,
+            last_heartbeat_at=record.last_heartbeat_at,
             processed_chunk_count=record.processed_chunk_count,
             graph_node_count=record.graph_node_count,
             graph_edge_count=record.graph_edge_count,
@@ -255,6 +258,7 @@ async def retry_upload(
         await upload_service.mark_failed(
             db,
             upload_id,
+            task_id,
             "The stored PDF is no longer available. Upload the document again.",
             FailureCategory.DOCUMENT_ERROR,
             False,
@@ -276,6 +280,7 @@ async def retry_upload(
         await upload_service.mark_failed(
             db,
             upload_id,
+            task_id,
             "The processing worker is unavailable. Please retry when the service is restored.",
             FailureCategory.WORKER_ERROR,
             True,

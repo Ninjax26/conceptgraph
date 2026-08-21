@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -34,6 +34,21 @@ class Settings(BaseSettings):
     groq_model: str = Field(default="llama-3.1-8b-instant", alias="GROQ_MODEL")
     gemini_api_key: str | None = Field(default=None, alias="GEMINI_API_KEY")
     gemini_model: str = Field(default="gemini-1.5-flash", alias="GEMINI_MODEL")
+    evidence_min_score: float = Field(default=0.35, ge=0, le=1, alias="EVIDENCE_MIN_SCORE")
+    evidence_medium_score: float = Field(default=0.5, ge=0, le=1, alias="EVIDENCE_MEDIUM_SCORE")
+    evidence_high_score: float = Field(default=0.7, ge=0, le=1, alias="EVIDENCE_HIGH_SCORE")
+
+    @model_validator(mode="after")
+    def validate_evidence_thresholds(self) -> "Settings":
+        if not (
+            self.evidence_min_score
+            <= self.evidence_medium_score
+            <= self.evidence_high_score
+        ):
+            raise ValueError(
+                "Evidence thresholds must satisfy min <= medium <= high."
+            )
+        return self
 
     @property
     def postgres_dsn(self) -> str:

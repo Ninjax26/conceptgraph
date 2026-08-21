@@ -60,7 +60,7 @@ There is no implemented user account, organization, role, or access-control mode
 - Graph extraction samples at most eight excerpts of 700 characters, so the graph is intentionally incomplete relative to all chunks.
 - Graph extraction is a single LLM call; large or broad documents may produce sparse coverage.
 - Query graph retrieval always starts with the deterministic fallback Cypher. The implemented LLM Cypher generator is not invoked by `retrieve()`.
-- Exam generation scrolls all matching chunks, then truncates prompt context to 24,000 characters; selection is storage order, not semantic or coverage-aware.
+- Exam generation scrolls all matching chunks, then selects at most twelve deduplicated excerpts round-robin across document/topic groups. Selection is coverage-aware but not semantically ranked.
 - Citation relevance is inferred from reranking; there is no entailment check connecting individual claims to sources.
 - `source_id` is stable only within one response, not across requests.
 - Tests cover a narrow set of pure rules and one mocked readiness case. There are no API, worker, database integration, frontend, load, security, or end-to-end tests in the repository.
@@ -191,7 +191,7 @@ Qdrant semantic retrieval filters by `upload_id IN context.document_ids`, reques
 
 `ExamPanel.handleGenerate` → `generateExam` → `generate_exam` endpoint → `CourseService.get_ready_context` → `ExamService.generate_exam` → `_retrieve_chunks_by_metadata` → `_build_context` → `_generate_questions` → Groq/Gemini → `_parse_questions` → `ExamResponse`.
 
-Unlike query retrieval, exam retrieval performs no semantic search. It scrolls every Qdrant point belonging to READY document IDs in batches of 100. `_build_context` includes at most six chunks and at most 24,000 characters. The exact ordering is Qdrant scroll order; no code ensures document diversity, page order, topic coverage, or highest relevance. The LLM must return exactly the requested count and four options per question; otherwise generation fails.
+Unlike query retrieval, exam retrieval performs no semantic search. It scrolls every Qdrant point belonging to READY document IDs in batches of 100. `_select_exam_sources` deduplicates passages and selects at most twelve excerpts round-robin across document/topic groups, ordered by page and chunk within each group. The LLM must return exactly the requested count, four options, a topic, and valid provided citation IDs; otherwise generation fails.
 
 ## 4. Data Flow and Storage Matrix
 
@@ -216,7 +216,7 @@ Unlike query retrieval, exam retrieval performs no semantic search. It scrolls e
 | Citation building | ranked chunks | max four sources | process memory | `build_sources` | non-empty passages | endpoint returns 404 if none |
 | Synthesis | question, graph, sources | grounded answer | LLM | `SynthesisService.synthesize` | provider response | config/retrieval errors |
 | Exam retrieval | ready IDs | all chunk payloads | Qdrant | `_retrieve_chunks_by_metadata` | ≥1 point | endpoint 409 if none |
-| Exam generation | max six excerpts | validated MCQs | LLM/process memory | `_generate_questions`, `_parse_questions` | exact count, valid options | 500/503/400 according to endpoint branch |
+| Exam generation | up to twelve coverage-selected excerpts | validated cited MCQs | LLM/process memory | `_generate_questions`, `_parse_questions` | exact count, valid options/topics/source IDs | 500/503/400 according to endpoint branch |
 | Dashboard | API responses | UI state | React memory only | `Dashboard` hooks | render/poll succeeds | local error panel/error boundary |
 
 ## 5. File-by-File Guide
@@ -292,7 +292,7 @@ Unlike query retrieval, exam retrieval performs no semantic search. It scrolls e
 | `requirements.txt` | Unpinned Python dependencies. Reproducibility is not guaranteed across fresh installs. |
 | `package.json` / `package-lock.json` | Frontend scripts and locked npm dependency graph. |
 | `vite.config.ts`, `tsconfig*.json`, `tailwind.config.ts`, `postcss.config.js` | Frontend build, type, path alias, Tailwind, and PostCSS configuration. |
-| `tests/test_processing.py` | Six `unittest` assertions covering normalization, two failure classes, citation deduplication/ID omission, and empty ready context. |
+| `tests/test_processing.py` | Unit coverage for normalization, failure classes, READY gating, retry enqueue failure, task fencing, citation deduplication, evidence thresholds, graph direction, graph integrity, and cited exam validation. |
 | `scaffold.sh` | Repository scaffolding helper; not part of runtime. Its exact historical use cannot be proven. |
 
 Package marker files such as `app/__init__.py`, `app/api/__init__.py`, and similar one-line files define Python packages but contain no domain behavior.
@@ -453,10 +453,10 @@ The query-specific fallback:
 - scopes course IDs and READY upload IDs;
 - tokenizes up to 12 terms from the question;
 - matches term substrings against lowercased concept names;
-- optionally matches any incoming relationship to the concept;
+- optionally matches relationships in both directions and returns every adjacent concept;
 - returns at most five concepts.
 
-If no records match, `_fetch_course_graph` returns up to 50 concepts ordered by name with incoming relationships. `_fetch_graph_totals` counts course concepts and outgoing relationships for READY document IDs. Relationship direction in API output is hardcoded as `outgoing` based on Neo4j start/end nodes.
+If no records match, `_fetch_course_graph` returns up to 50 concepts ordered by name with bidirectional adjacent relationships. `_fetch_graph_totals` counts course concepts and outgoing relationships for READY document IDs. API direction is preserved from each Neo4j relationship's native start and end nodes.
 
 Earlier behavior treated every incoming relationship as a “prerequisite” for query expansion regardless of type, allowing `PART_OF`, `RELATED_TO`, and arbitrary edges to add noise.
 
@@ -484,7 +484,7 @@ The standard model is small and fast compared with larger embedding models, but 
 
 `cross-encoder/ms-marco-MiniLM-L-6-v2` scores the ten bi-encoder candidates as `(question, passage)` pairs. Cross-encoders usually improve ranking precision because they jointly encode query and text, but cost one inference per pair and cannot efficiently search the whole corpus. Here the candidate count bounds that cost.
 
-No rerank score threshold is applied. Even weak results can become sources. The weak-evidence fallback is only used when no sources exist, not when scores are low.
+Rerank logits are converted through a sigmoid and combined with normalized vector similarity. Passages below `EVIDENCE_MIN_SCORE` are removed before citation and synthesis. Responses expose typed `high`, `medium`, `low`, or `insufficient` confidence metadata; insufficient evidence returns the fixed fallback without an LLM synthesis call.
 
 ## 10. Processing Lifecycle and Consistency
 
@@ -513,7 +513,7 @@ stateDiagram-v2
 
 `CANCELLED` exists in enums and UI types, but no service transition or cancellation endpoint sets it.
 
-Each `set_stage` opens a fresh async session in the worker and commits independently. This gives durable progress visibility but not one atomic distributed transaction. READY is committed only after vector write, graph write, and count assembly have returned. There is no two-phase commit across PostgreSQL, Qdrant, and Neo4j. Correctness is achieved through readiness gating, deterministic IDs, and best-effort compensation.
+Each `set_stage` opens a fresh async session in the worker and commits independently. Worker transitions require the current Celery task ID and an active document, preventing stale attempts from advancing or completing a newer retry. A 30-second heartbeat updates both the document and current attempt while long provider/model operations run. READY is committed only after vector write, graph write, and count assembly have returned. There is no two-phase commit across PostgreSQL, Qdrant, and Neo4j. Correctness is achieved through readiness gating, task fencing, deterministic IDs, and best-effort compensation.
 
 Important windows:
 
@@ -563,21 +563,21 @@ Returns 204 for a failed record and removes its file. Returns 409 for missing or
 
 ### `POST /api/v1/query`
 
-Request: `{question: non-empty string, course_id: non-empty name-or-UUID}`. Response: `{answer, sources, graph_context, graph_metadata}`.
+Request: `{question: non-empty string, course_id: non-empty name-or-UUID}`. Response: `{answer, sources, graph_context, graph_metadata, confidence}`.
 
 Errors: 404 unknown course or no source passages; 409 no READY documents or READY records with missing vectors; 503 provider configuration, graph/vector retrieval, reranking, or synthesis failures. Timeout is enforced only by the frontend at 60 seconds, not server-side.
 
 ### `POST /api/v1/exam/generate`
 
-Request: `{course_id, num_questions=5}` with count 1–20. Response: canonical course UUID, validated questions, and `source_count` (number of context chunks capped at six, not citations). Errors: 404 course absent; 409 no READY documents or no vectors; 503 missing provider; 400 service `ValueError`; 500 other generation/provider/schema failures. Provider transient errors are mapped differently from query (500 versus query’s 503), which is a contract inconsistency.
+Request: `{course_id, num_questions=5}` with count 1–20. Response: canonical course UUID, validated topic-tagged questions, per-question document/page/passage citations, unique cited `source_count`, and topic/document/page coverage metadata. Context selection uses up to twelve excerpts round-robin across document/topic groups. Invented or missing citation IDs invalidate a generated question. Errors: 404 course absent; 409 no READY documents or no vectors; 503 missing provider; 400 service `ValueError`; 500 other generation/provider/schema failures.
 
 ## 12. Background Worker Semantics
 
-Celery uses Redis for both broker and result backend. The documented local command uses `--pool=solo --concurrency=1`; this serializes all PDFs in one worker process. Application code does not configure serializer, task routes, prefetch, result expiry, acknowledgment behavior, retries, time limits, heartbeat behavior, or visibility timeout.
+Celery uses Redis for both broker and result backend. The documented local command uses `--pool=solo --concurrency=1`; this serializes all PDFs in one worker process. Application code adds a domain heartbeat and task-ID fencing, but does not configure serializer, task routes, prefetch, result expiry, acknowledgment behavior, broker retries, time limits, or visibility timeout.
 
 The task catches errors and returns a normal `{"status":"failed"}` result instead of raising. Celery therefore considers the task execution successful at the transport level, while PostgreSQL represents domain failure. This avoids automatic broker retries but makes Celery monitoring alone misleading.
 
-Retry is application-controlled through the HTTP endpoint. It is not Celery `self.retry`. Row locking prevents two HTTP retry requests from both updating the record. There is no execution-time lock preventing an old delayed task and a new retry task from processing the same document concurrently. Deterministic Qdrant IDs reduce duplicate vectors, but concurrent Neo4j operations and competing PostgreSQL stage updates remain possible.
+Retry is application-controlled through the HTTP endpoint. It is not Celery `self.retry`. Row locking prevents two HTTP retry requests from both updating the record. Task-ID fencing prevents old delayed tasks from changing PostgreSQL state or cleaning current data; deterministic Qdrant and Neo4j IDs keep any already-started external writes idempotent.
 
 ## 13. Failure Handling
 
@@ -637,7 +637,7 @@ Maximum attempts are three total, including the original. `mark_failed` clears r
 | Neo4j write | O(nodes + edges) network round trips and no indexes | constraints, indexes, explicit transaction, `UNWIND` batched writes |
 | Neo4j read | substring scan on names; up to 50 fallback concepts | full-text index, precomputed graph search fields, query plans, bounded traversals |
 | Reranker | CPU/MPS cross-encoder per request, no batching/cache | shared inference service, batching, candidate/score thresholds, query cache |
-| Exam | scrolls every course chunk even though only six are used | reservoir/coverage sampling, metadata ordering, semantic/topic selection, server-side cap |
+| Exam | scrolls every course chunk before selecting twelve | indexed topic summaries, semantic selection, and a server-side scroll cap |
 | LLM | dominant latency, external rate limits, 60 s browser timeout | provider timeout/retry/circuit breaker, streaming, caching, smaller prompts |
 
 At 100,000 PDFs, the current design breaks operationally before raw database capacity: local disk is not shared; a solo worker creates an enormous queue; course-wide exam scroll is unbounded; missing Qdrant/Neo4j indexes increase latency; no tenant quotas exist; models are replicated per process; and one collection/schema has no embedding-version migration story.
@@ -777,7 +777,7 @@ These answers defend the implementation honestly. A strong interview answer shou
 
 13. **Can retries race?** `retry_upload` uses `SELECT ... FOR UPDATE`; the first transaction changes FAILED to UPLOADED, so a second request fails admission. Old and new Celery tasks can still overlap because there is no execution lease.
 
-14. **How are stale jobs detected?** `expire_stale_uploads` marks active rows older than 15 minutes failed when the list endpoint is called. This is demand-driven, not a scheduler or heartbeat.
+14. **How are stale jobs detected?** Workers update document and attempt heartbeat timestamps every 30 seconds. `expire_stale_uploads` marks active rows with no heartbeat for 15 minutes failed when the list endpoint is called. Expiration remains demand-triggered, but long-running healthy stages no longer look stale.
 
 15. **Why not mark jobs failed from Celery backend state?** The implementation treats PostgreSQL as domain truth and does not reconcile Celery state. Celery task exceptions are swallowed into domain failure results, so backend state alone would be insufficient.
 
@@ -835,13 +835,13 @@ These answers defend the implementation honestly. A strong interview answer shou
 
 ### Retrieval, GraphRAG, embeddings, and LLMs
 
-41. **Describe the GraphRAG algorithm actually used.** Deterministic term-based Neo4j lookup finds concepts and incoming related nodes; their names expand the semantic query; MiniLM retrieves ten READY-filtered chunks; a cross-encoder reranks; top deduped passages feed grounded synthesis.
+41. **Describe the GraphRAG algorithm actually used.** Deterministic term-based Neo4j lookup finds concepts and bidirectional adjacent nodes while preserving edge direction; only correctly directed incoming prerequisites expand the semantic query. MiniLM retrieves ten READY-filtered chunks, a cross-encoder reranks, an evidence gate filters weak passages, and top deduplicated sources feed grounded synthesis.
 
 42. **Does the query use LLM-generated Cypher?** No. `generate_cypher` exists, but `execute_graph_retrieval` directly uses `_fallback_cypher`. Claiming active text-to-Cypher would be inaccurate.
 
 43. **How are query terms selected?** Regex extracts alphanumeric/underscore/plus/minus tokens starting with a letter, length at least three, lowercases them, and keeps twelve. There is no stop-word removal or stemming.
 
-44. **What happens when no concept name matches?** The service fetches up to 50 course concepts ordered by name and includes their incoming relationships.
+44. **What happens when no concept name matches?** The service fetches up to 50 course concepts ordered by name and includes their bidirectional adjacent relationships.
 
 45. **What is “prerequisite” in code?** Every incoming neighboring concept, irrespective of relationship type. This is semantically broader than true prerequisites and should become type-aware.
 
@@ -857,7 +857,7 @@ These answers defend the implementation honestly. A strong interview answer shou
 
 51. **Why use a cross-encoder after ANN?** ANN gives efficient high-recall candidates; joint query-passage encoding improves precision at bounded cost. Cross-encoding the whole corpus is computationally infeasible.
 
-52. **How are weak answers handled?** Only an empty source list triggers a no-evidence path. There is no score threshold or calibrated confidence, so low-quality retrieved sources can still produce confident synthesis.
+52. **How are weak answers handled?** A configurable combined rerank/vector evidence score filters passages before citation. No qualifying passage returns the fixed weak-evidence answer and `insufficient` confidence without invoking synthesis. Confidence is a retrieval heuristic, not a calibrated probability or entailment proof.
 
 53. **How does the prompt prevent hallucination?** It instructs the model to use only supplied sources, cite them, and return a fixed fallback when evidence is insufficient. This is behavioral prompting, not a guarantee or verifier.
 
@@ -887,9 +887,9 @@ These answers defend the implementation honestly. A strong interview answer shou
 
 66. **Why not use graph embeddings?** Not implemented and no benchmark justifies them. Current graph contributes symbolic names only, keeping the pipeline understandable but limited.
 
-67. **How does exam retrieval differ from query retrieval?** It filter-scrolls all READY chunks with no query vector or reranking, then uses a small bounded prefix/context selection.
+67. **How does exam retrieval differ from query retrieval?** It filter-scrolls all READY chunks with no query vector or reranking, then selects up to twelve deduplicated excerpts round-robin across document/topic groups.
 
-68. **Why is exam source_count not a citation count?** It is `min(6, len(chunks))`, reflecting chunks considered by `_build_context`; questions do not expose source objects.
+68. **What does exam source_count represent?** It is the number of unique validated source IDs actually cited by returned questions. Each question exposes enriched document, page, heading, and supporting passage objects.
 
 69. **How is exam output validated?** Pydantic forbids extra fields, requires non-empty strings, exactly four options, and exact correct-answer membership. Service additionally requires exactly the requested number of valid questions.
 
@@ -959,7 +959,7 @@ These answers defend the implementation honestly. A strong interview answer shou
 
 ## 22. Skeptical Staff-Engineer Cross-Examination
 
-**Why do you call this GraphRAG when graph search is shallow term matching?** The graph materially expands vector queries with incoming related concept names, so it is graph-augmented retrieval. It is not a sophisticated graph-ranking system, and I would describe it as a baseline GraphRAG implementation.
+**Why do you call this GraphRAG when graph search is shallow term matching?** The graph materially expands vector queries with correctly directed prerequisite names while returning bidirectional context for display, so it is graph-augmented retrieval. It is not a sophisticated graph-ranking system, and I would describe it as a baseline GraphRAG implementation.
 
 **Why maintain Neo4j if vector retrieval can answer independently?** The current product uses graph context for query expansion and visualization. Whether that value justifies a database must be measured against vector-only retrieval; the repository contains no such evaluation.
 
@@ -1043,7 +1043,7 @@ Start with identity and control state. User-entered course names are display met
 
 The upload request does only bounded work: file/MIME/size/PDF validation, local persistence, hashing, duplicate admission under a PostgreSQL advisory lock, row creation, and Celery publication. The worker advances through explicit extraction, chunking, embedding, graph, and READY stages. Qdrant point IDs and Neo4j concept IDs are deterministic/provenance-scoped, which makes retries idempotent and cleanup targeted. Since there is no cross-database transaction, failure handling deletes partial Qdrant and Neo4j data and marks a safe classified error. Read paths filter by PostgreSQL READY IDs, so failed orphaned derived data is normally invisible.
 
-The query pipeline uses a deterministic read-only Cypher query, not the implemented but currently unused LLM Cypher generator. Matching concepts and incoming neighbors expand the question. MiniLM cosine search retrieves ten chunks, an MS MARCO MiniLM cross-encoder reranks them, and citation construction emits up to four document/page/section/passage sources. Synthesis sees no vector point IDs and is instructed to cite `[Source n]`. Graph totals and query-subgraph counts let the UI explain how much is displayed.
+The query pipeline uses a deterministic read-only Cypher query, not the implemented but currently unused LLM Cypher generator. Matching concepts return bidirectional neighbors, while only incoming prerequisite sources expand the question. MiniLM cosine search retrieves ten chunks, an MS MARCO MiniLM cross-encoder reranks them, and a combined evidence gate filters weak passages before citation construction emits up to four document/page/section/passage sources. Synthesis sees no vector point IDs and is instructed to cite `[Source n]`. Graph totals and query-subgraph counts let the UI explain how much is displayed.
 
 Exam generation shares exactly the same course readiness service but retrieves by metadata rather than similarity. It scrolls the READY document chunks, bounds context, and validates exact question count, four options, and answer membership.
 

@@ -58,10 +58,16 @@ export default function ExamPanel({ courseId }: ExamPanelProps): JSX.Element {
       {(exam || error) && isOpen ? (
         <div className="mt-4 max-h-96 space-y-3 overflow-y-auto pr-1">
           {error ? <p className="rounded-md bg-red-50 p-3 text-xs text-red-700">{error}</p> : null}
+          {exam?.coverage.topics?.length ? (
+            <p className="text-xs text-slate-500">
+              Covers {exam.coverage.topics.length} topics across {exam.coverage.documents?.length ?? 0} documents using {exam.source_count} cited passages.
+            </p>
+          ) : null}
           {exam?.questions.map((item, index) => {
             const isRevealed = revealed.includes(index);
             return (
               <article className="rounded-md border border-slate-200 bg-white p-3" key={`${index}-${item.question_text}`}>
+                <p className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-teal-700">{item.topic}</p>
                 <p className="text-sm font-semibold text-ink">{index + 1}. {item.question_text}</p>
                 <ol className="mt-2 space-y-1 text-xs text-slate-600">
                   {item.options.map((option) => <li key={option}>{option}</li>)}
@@ -75,8 +81,16 @@ export default function ExamPanel({ courseId }: ExamPanelProps): JSX.Element {
                   {isRevealed ? "Hide answer" : "Reveal answer"}
                 </button>
                 {isRevealed ? (
-                  <div className="mt-2 rounded bg-teal-50 p-2 text-xs leading-5 text-teal-950">
-                    <strong>{item.correct_answer}</strong><br />{item.explanation}
+                  <div className="mt-2 space-y-2 rounded bg-teal-50 p-2 text-xs leading-5 text-teal-950">
+                    <p><strong>{item.correct_answer}</strong><br />{item.explanation}</p>
+                    {item.sources.map((source) => (
+                      <details className="rounded border border-teal-200 bg-white/70 p-2" key={source.source_id}>
+                        <summary className="cursor-pointer font-semibold">
+                          {source.document_name}{source.page_number ? ` · Page ${source.page_number}` : ""}{source.section_heading ? ` · ${source.section_heading}` : ""}
+                        </summary>
+                        <p className="mt-1 text-slate-700">{source.supporting_passage}</p>
+                      </details>
+                    ))}
                   </div>
                 ) : null}
               </article>
