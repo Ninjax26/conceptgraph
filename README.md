@@ -114,6 +114,7 @@ NEO4J_USERNAME=neo4j
 NEO4J_PASSWORD=conceptgraph_password
 
 QDRANT_URL=http://localhost:6333
+QDRANT_API_KEY=
 QDRANT_COLLECTION_NAME=conceptgraph_chunks
 
 POSTGRES_USER=conceptgraph
@@ -121,6 +122,12 @@ POSTGRES_PASSWORD=conceptgraph_password
 POSTGRES_DB=conceptgraph
 
 REDIS_URL=redis://localhost:6379/0
+
+# Optional locally; required before exposing a public deployment.
+DEMO_ACCESS_TOKEN=
+AUTH_COOKIE_SECURE=false
+AUTH_COOKIE_SAMESITE=lax
+AUTH_SESSION_TTL_SECONDS=43200
 
 OBJECT_STORAGE_BACKEND=s3
 S3_BUCKET=conceptgraph-pdfs
@@ -133,6 +140,10 @@ S3_AUTO_CREATE_BUCKET=true
 ```
 
 These object-storage credentials are development-only defaults for the local MinIO container. Use a private bucket and platform-managed secrets in deployment.
+
+The local Docker Qdrant instance does not require an API key. For Qdrant Cloud, replace `QDRANT_URL` with the HTTPS cluster endpoint and set `QDRANT_API_KEY` to the cluster API key. Never commit either provider secret.
+
+When `DEMO_ACCESS_TOKEN` is empty, local API protection is disabled. Public deployments must use a random value of at least 24 characters, for example `openssl rand -base64 32`. The dashboard exchanges this value for a signed, short-lived HttpOnly cookie; frontend JavaScript does not persist the secret.
 
 If you are on Apple Silicon and run into fork safety issues, set:
 
@@ -240,6 +251,9 @@ Evidence thresholds are configurable with `EVIDENCE_MIN_SCORE`, `EVIDENCE_MEDIUM
 
 ## API Endpoints
 
+- `POST /api/v1/auth/session` (public access-code exchange)
+- `GET /api/v1/auth/session`
+- `DELETE /api/v1/auth/session`
 - `POST /api/v1/ingest/upload`
 - `GET /api/v1/ingest/status/{task_id}`
 - `GET /api/v1/ingest/uploads`
@@ -250,6 +264,8 @@ Evidence thresholds are configurable with `EVIDENCE_MIN_SCORE`, `EVIDENCE_MEDIUM
 - `POST /api/v1/query`
 - `POST /api/v1/exam/generate`
 - `GET /api/v1/health`
+
+When `DEMO_ACCESS_TOKEN` is configured, health and the session exchange are public and every other `/api/v1` route is protected. Browser calls use the HttpOnly session cookie. Scripts may send the deployment token as `Authorization: Bearer <token>`. Redis applies separate per-minute limits to login attempts, ordinary routes, and expensive upload/query/exam/retry actions.
 
 ## Application Containers
 
@@ -289,6 +305,8 @@ Before the first Blueprint sync, prepare private Neo4j, Qdrant, and S3-compatibl
 
 - `VITE_API_BASE_URL` to `https://<api-service>.onrender.com/api/v1`.
 - `CORS_ALLOWED_ORIGINS` to the frontend URL, without a trailing slash.
+- `QDRANT_URL` to the Qdrant Cloud HTTPS cluster endpoint and `QDRANT_API_KEY` to its API key. The worker inherits both from the API service.
+- `DEMO_ACCESS_TOKEN` to a new random value of at least 24 characters. Do not reuse the Groq, Qdrant, database, or storage key.
 - `S3_ENDPOINT_URL` to the provider endpoint; use an empty value for AWS S3.
 - `S3_FORCE_PATH_STYLE=true` only when required by the selected provider.
 
@@ -357,7 +375,7 @@ Run backend rules and frontend production checks with:
 npm run build
 ```
 
-The backend tests cover course normalization and logical duplicate summaries, failure retryability, READY gating, citation deduplication, missing graph endpoints, duplicate relationships, object-storage round trips, legacy reads, cloud database URLs, and PDF range responses.
+The 29 backend tests cover course normalization and logical duplicate summaries, failure retryability, READY gating, citation deduplication, missing graph endpoints, duplicate relationships, object-storage round trips, legacy reads, cloud database URLs, PDF range responses, Qdrant secret handling, signed-session integrity/expiry, access middleware/cookie exchange, and Redis rate-limit counters.
 
 ## Notes
 

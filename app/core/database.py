@@ -45,7 +45,10 @@ neo4j_driver: AsyncDriver = AsyncGraphDatabase.driver(
     auth=(settings.neo4j_username, settings.neo4j_password),
 )
 
-qdrant_client: QdrantClient = QdrantClient(url=settings.qdrant_url)
+qdrant_client: QdrantClient = QdrantClient(
+    url=settings.qdrant_url,
+    api_key=settings.qdrant_api_key_value,
+)
 
 
 async def get_postgres_session() -> AsyncGenerator[AsyncSession, None]:

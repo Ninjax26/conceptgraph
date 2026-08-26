@@ -2,6 +2,7 @@ import { lazy, Suspense, useEffect, useState } from "react";
 import { Network, ArrowLeft } from "lucide-react";
 
 import AppErrorBoundary from "@/components/AppErrorBoundary";
+import DemoAccessGate from "@/components/DemoAccessGate";
 
 const Home = lazy(() => import("@/pages/Home"));
 const Dashboard = lazy(() => import("@/pages/Dashboard"));
@@ -72,7 +73,11 @@ export default function App(): JSX.Element {
         <AppErrorBoundary>
           <Suspense fallback={<div className="grid min-h-[calc(100vh-64px)] place-items-center text-sm text-slate-500">Loading workspace...</div>}>
             {page === "home" && <Home navigate={navigate} />}
-            {page === "dashboard" && <Dashboard />}
+            {page === "dashboard" && (
+              <DemoAccessGate>
+                <Dashboard />
+              </DemoAccessGate>
+            )}
           </Suspense>
         </AppErrorBoundary>
       </div>

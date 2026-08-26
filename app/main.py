@@ -4,12 +4,15 @@ from collections.abc import AsyncGenerator
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.endpoints.auth import router as auth_router
 from app.api.endpoints.exam import router as exam_router
 from app.api.endpoints.ingest import router as ingest_router
 from app.api.endpoints.query import router as query_router
 from app.core.database import close_database_connections, initialize_database_schema
 from app.core.database import postgres_engine
 from app.core.config import settings
+from app.core.security import DemoProtectionMiddleware
+from app.services.security_service import rate_limit_service
 from sqlalchemy import text
 
 LOCAL_DEV_ORIGIN_REGEX = r"https?://(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?$"
@@ -19,11 +22,13 @@ LOCAL_DEV_ORIGIN_REGEX = r"https?://(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?$"
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await initialize_database_schema()
     yield
+    await rate_limit_service.close()
     await close_database_connections()
 
 
 app = FastAPI(title="ConceptGraph", lifespan=lifespan)
 
+app.add_middleware(DemoProtectionMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -40,6 +45,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(auth_router)
 app.include_router(query_router)
 app.include_router(exam_router)
 app.include_router(ingest_router)

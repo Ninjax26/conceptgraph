@@ -61,12 +61,16 @@ export const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000/api/v1";
 
 async function fetchWithTimeout(url: string, options: RequestInit & { timeout?: number } = {}) {
-  const { timeout = 30000 } = options;
+  const { timeout = 30000, ...requestOptions } = options;
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeout);
   
   try {
-    const response = await fetch(url, { ...options, signal: controller.signal });
+    const response = await fetch(url, {
+      credentials: "include",
+      ...requestOptions,
+      signal: controller.signal,
+    });
     clearTimeout(id);
     if (!response.ok) {
       let message = response.statusText;
@@ -95,6 +99,44 @@ async function fetchWithTimeout(url: string, options: RequestInit & { timeout?: 
     }
     throw error;
   }
+}
+
+export interface AuthSessionStatus {
+  enabled: boolean;
+  authenticated: boolean;
+  expires_in_seconds: number | null;
+}
+
+export async function getAuthSession(): Promise<AuthSessionStatus> {
+  const response = await fetch(`${API_BASE_URL}/auth/session`, {
+    method: "GET",
+    credentials: "include",
+    cache: "no-store",
+  });
+  if (response.status === 401) {
+    return { enabled: true, authenticated: false, expires_in_seconds: null };
+  }
+  if (!response.ok) {
+    throw new Error("Could not verify dashboard access.");
+  }
+  return response.json() as Promise<AuthSessionStatus>;
+}
+
+export async function createAuthSession(accessCode: string): Promise<AuthSessionStatus> {
+  const response = await fetchWithTimeout(`${API_BASE_URL}/auth/session`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ access_code: accessCode }),
+    timeout: 15000,
+  });
+  return response.json() as Promise<AuthSessionStatus>;
+}
+
+export async function deleteAuthSession(): Promise<void> {
+  await fetchWithTimeout(`${API_BASE_URL}/auth/session`, {
+    method: "DELETE",
+    timeout: 15000,
+  });
 }
 
 export async function sendQuery(

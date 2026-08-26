@@ -28,6 +28,8 @@ services:
         sync: false
       - key: QDRANT_URL
         sync: false
+      - key: QDRANT_API_KEY
+        sync: false
       - key: QDRANT_COLLECTION_NAME
         value: conceptgraph_chunks
       - key: OBJECT_STORAGE_BACKEND
@@ -48,6 +50,20 @@ services:
         value: "false"
       - key: CORS_ALLOWED_ORIGINS
         sync: false
+      - key: DEMO_ACCESS_TOKEN
+        sync: false
+      - key: AUTH_COOKIE_SECURE
+        value: "true"
+      - key: AUTH_COOKIE_SAMESITE
+        value: lax
+      - key: AUTH_SESSION_TTL_SECONDS
+        value: "43200"
+      - key: RATE_LIMIT_REQUESTS_PER_MINUTE
+        value: "300"
+      - key: RATE_LIMIT_EXPENSIVE_PER_MINUTE
+        value: "30"
+      - key: RATE_LIMIT_LOGIN_PER_MINUTE
+        value: "10"
 
   - type: worker
     name: conceptgraph-worker
@@ -96,6 +112,11 @@ services:
           type: web
           name: conceptgraph-api
           envVarKey: QDRANT_URL
+      - key: QDRANT_API_KEY
+        fromService:
+          type: web
+          name: conceptgraph-api
+          envVarKey: QDRANT_API_KEY
       - key: QDRANT_COLLECTION_NAME
         fromService:
           type: web

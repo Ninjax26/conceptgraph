@@ -1,7 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -24,8 +24,34 @@ class Settings(BaseSettings):
         default="conceptgraph_chunks",
         alias="QDRANT_COLLECTION_NAME",
     )
+    qdrant_api_key: SecretStr | None = Field(default=None, alias="QDRANT_API_KEY")
     redis_url: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
     cors_allowed_origins: str = Field(default="", alias="CORS_ALLOWED_ORIGINS")
+    demo_access_token: SecretStr | None = Field(default=None, alias="DEMO_ACCESS_TOKEN")
+    auth_cookie_name: str = Field(default="conceptgraph_access", alias="AUTH_COOKIE_NAME")
+    auth_cookie_secure: bool = Field(default=False, alias="AUTH_COOKIE_SECURE")
+    auth_cookie_samesite: str = Field(default="lax", alias="AUTH_COOKIE_SAMESITE")
+    auth_session_ttl_seconds: int = Field(
+        default=12 * 60 * 60,
+        ge=300,
+        le=7 * 24 * 60 * 60,
+        alias="AUTH_SESSION_TTL_SECONDS",
+    )
+    rate_limit_requests_per_minute: int = Field(
+        default=300,
+        ge=1,
+        alias="RATE_LIMIT_REQUESTS_PER_MINUTE",
+    )
+    rate_limit_expensive_per_minute: int = Field(
+        default=30,
+        ge=1,
+        alias="RATE_LIMIT_EXPENSIVE_PER_MINUTE",
+    )
+    rate_limit_login_per_minute: int = Field(
+        default=10,
+        ge=1,
+        alias="RATE_LIMIT_LOGIN_PER_MINUTE",
+    )
 
     object_storage_backend: str = Field(default="s3", alias="OBJECT_STORAGE_BACKEND")
     s3_bucket: str = Field(default="conceptgraph-pdfs", alias="S3_BUCKET")
@@ -88,6 +114,18 @@ class Settings(BaseSettings):
             raise ValueError("S3_BUCKET is required when object storage is enabled.")
         return self
 
+    @model_validator(mode="after")
+    def validate_demo_security(self) -> "Settings":
+        self.auth_cookie_samesite = self.auth_cookie_samesite.strip().lower()
+        if self.auth_cookie_samesite not in {"lax", "strict"}:
+            raise ValueError("AUTH_COOKIE_SAMESITE must be lax or strict.")
+        if not self.auth_cookie_name.strip():
+            raise ValueError("AUTH_COOKIE_NAME cannot be empty.")
+        token = self.demo_access_token_value
+        if token is not None and len(token) < 24:
+            raise ValueError("DEMO_ACCESS_TOKEN must contain at least 24 characters.")
+        return self
+
     @property
     def postgres_dsn(self) -> str:
         if self.database_url:
@@ -119,6 +157,18 @@ class Settings(BaseSettings):
             for origin in self.cors_allowed_origins.split(",")
             if origin.strip()
         ]
+
+    @property
+    def qdrant_api_key_value(self) -> str | None:
+        if self.qdrant_api_key is None:
+            return None
+        return self.qdrant_api_key.get_secret_value().strip() or None
+
+    @property
+    def demo_access_token_value(self) -> str | None:
+        if self.demo_access_token is None:
+            return None
+        return self.demo_access_token.get_secret_value().strip() or None
 
 
 @lru_cache

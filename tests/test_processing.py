@@ -9,16 +9,20 @@ from unittest.mock import ANY, AsyncMock, patch
 
 import fitz
 from botocore.exceptions import EndpointConnectionError
-from fastapi import HTTPException, UploadFile
+from fastapi import HTTPException, Request, UploadFile
+from starlette.responses import JSONResponse
 from starlette.datastructures import Headers
 
-from app.api.endpoints import ingest
+from app.api.endpoints import auth, ingest
 from app.core.config import Settings
 from app.core.processing import FailureCategory, ProcessingStage, classify_failure, normalize_course_name
+from app.core.security import DemoProtectionMiddleware
+from app.schemas.auth import AccessCodeRequest
 from app.services.citation_service import assess_evidence, build_sources
 from app.services.course_service import CourseNotReadyError, CourseService
 from app.services.exam_service import ExamService
 from app.services.rag_service import RetrievalService
+from app.services.security_service import DemoAccessService, RateLimitResult, RateLimitService
 from app.services.storage_service import ObjectStorageError, StorageService
 from app.services.upload_service import UploadService
 from app.schemas.exam import ExamSource
@@ -31,6 +35,187 @@ class ProcessingRulesTests(unittest.TestCase):
         self.assertEqual(normalize_course_name("  CYBER  "), "cyber")
         self.assertEqual(normalize_course_name("Cyber"), "cyber")
         self.assertEqual(normalize_course_name("cyber"), "cyber")
+
+    def test_qdrant_api_key_is_unwrapped_only_for_the_client(self):
+        config = Settings(
+            _env_file=None,
+            QDRANT_API_KEY="qdrant-secret",
+        )
+
+        self.assertEqual(config.qdrant_api_key_value, "qdrant-secret")
+        self.assertNotIn("qdrant-secret", repr(config.qdrant_api_key))
+
+    def test_demo_cookie_is_signed_tamper_resistant_and_expires(self):
+        config = Settings(
+            _env_file=None,
+            DEMO_ACCESS_TOKEN="a-strong-demo-secret-value-123456",
+            AUTH_SESSION_TTL_SECONDS=300,
+        )
+        service = DemoAccessService(config)
+        cookie = service.issue_cookie(now=1_000)
+
+        self.assertTrue(service.verify_cookie(cookie, now=1_299))
+        self.assertFalse(service.verify_cookie(f"{cookie}tampered", now=1_299))
+        self.assertFalse(service.verify_cookie(cookie, now=1_301))
+        self.assertFalse(service.verify_cookie(cookie, now=900))
+
+    def test_demo_access_token_must_be_high_entropy(self):
+        with self.assertRaises(ValidationError):
+            Settings(_env_file=None, DEMO_ACCESS_TOKEN="short-token")
+
+    def test_rate_limit_is_shared_through_redis_counter(self):
+        class FakePipeline:
+            def __init__(self, redis):
+                self.redis = redis
+                self.key = ""
+
+            def incr(self, key):
+                self.key = key
+                return self
+
+            def expire(self, key, seconds):
+                self.redis.expiry = (key, seconds)
+                return self
+
+            async def execute(self):
+                self.redis.counts[self.key] = self.redis.counts.get(self.key, 0) + 1
+                return [self.redis.counts[self.key], True]
+
+        class FakeRedis:
+            def __init__(self):
+                self.counts = {}
+                self.expiry = None
+
+            def pipeline(self, transaction=True):
+                self.transaction = transaction
+                return FakePipeline(self)
+
+        service = RateLimitService("redis://unused")
+        fake_redis = FakeRedis()
+        service._client = fake_redis
+
+        first = asyncio.run(service.check("query:user", 2, now=120))
+        second = asyncio.run(service.check("query:user", 2, now=121))
+        third = asyncio.run(service.check("query:user", 2, now=122))
+
+        self.assertTrue(first.allowed)
+        self.assertEqual(second.remaining, 0)
+        self.assertFalse(third.allowed)
+        self.assertEqual(third.retry_after, 58)
+        self.assertEqual(fake_redis.expiry[1], 120)
+
+    def test_protected_route_rejects_a_missing_credential(self):
+        config = Settings(
+            _env_file=None,
+            DEMO_ACCESS_TOKEN="a-strong-demo-secret-value-123456",
+        )
+        access_service = DemoAccessService(config)
+        middleware = DemoProtectionMiddleware(AsyncMock())
+        request = Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/api/v1/ingest/courses",
+                "query_string": b"",
+                "headers": [],
+                "scheme": "https",
+                "server": ("api.example.com", 443),
+                "client": ("127.0.0.1", 1234),
+            }
+        )
+        call_next = AsyncMock(return_value=JSONResponse({"ok": True}))
+
+        with patch("app.core.security.demo_access_service", access_service):
+            response = asyncio.run(middleware.dispatch(request, call_next))
+
+        self.assertEqual(response.status_code, 401)
+        call_next.assert_not_awaited()
+
+    def test_valid_bearer_is_rate_limited_and_forwarded(self):
+        token = "a-strong-demo-secret-value-123456"
+        config = Settings(_env_file=None, DEMO_ACCESS_TOKEN=token)
+        access_service = DemoAccessService(config)
+        limiter = SimpleNamespace(
+            check=AsyncMock(
+                return_value=RateLimitResult(
+                    allowed=True,
+                    limit=300,
+                    remaining=299,
+                    retry_after=30,
+                )
+            )
+        )
+        middleware = DemoProtectionMiddleware(AsyncMock())
+        request = Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/api/v1/ingest/courses",
+                "query_string": b"",
+                "headers": [(b"authorization", f"Bearer {token}".encode())],
+                "scheme": "https",
+                "server": ("api.example.com", 443),
+                "client": ("127.0.0.1", 1234),
+            }
+        )
+        call_next = AsyncMock(return_value=JSONResponse({"ok": True}))
+
+        with (
+            patch("app.core.security.demo_access_service", access_service),
+            patch("app.core.security.rate_limit_service", limiter),
+        ):
+            response = asyncio.run(middleware.dispatch(request, call_next))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["X-RateLimit-Remaining"], "299")
+        call_next.assert_awaited_once()
+
+    def test_access_code_exchange_sets_an_httponly_cookie(self):
+        token = "a-strong-demo-secret-value-123456"
+        access_service = DemoAccessService(
+            Settings(_env_file=None, DEMO_ACCESS_TOKEN=token)
+        )
+        limiter = SimpleNamespace(
+            check=AsyncMock(
+                return_value=RateLimitResult(
+                    allowed=True,
+                    limit=10,
+                    remaining=9,
+                    retry_after=30,
+                )
+            )
+        )
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/api/v1/auth/session",
+                "query_string": b"",
+                "headers": [],
+                "scheme": "https",
+                "server": ("api.example.com", 443),
+                "client": ("127.0.0.1", 1234),
+            }
+        )
+        response = JSONResponse({})
+
+        with (
+            patch("app.api.endpoints.auth.demo_access_service", access_service),
+            patch("app.api.endpoints.auth.rate_limit_service", limiter),
+        ):
+            session = asyncio.run(
+                auth.create_session(
+                    AccessCodeRequest(access_code=token),
+                    request,
+                    response,
+                )
+            )
+
+        self.assertTrue(session.authenticated)
+        set_cookie = response.headers["set-cookie"]
+        self.assertIn("HttpOnly", set_cookie)
+        self.assertIn("SameSite=lax", set_cookie)
+        self.assertNotIn(token, set_cookie)
 
     def test_configuration_failure_is_permanent(self):
         category, retryable, _ = classify_failure(RuntimeError("GROQ_API_KEY is not configured"))

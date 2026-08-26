@@ -45,12 +45,14 @@ There is no implemented user account, organization, role, or access-control mode
 - Explicit processing stages and bounded retries.
 - Compensating cleanup of Qdrant and Neo4j data after worker failure.
 - Pydantic validation for graph extraction, exams, and HTTP payloads.
+- Optional shared-secret demo protection using signed HttpOnly sessions and Redis-backed rate limits.
+- Secret-safe Qdrant Cloud API-key configuration shared by API and worker.
 - Lazy frontend routes and graph/exam components.
 - Local Apple Silicon support through ARM64 containers and MPS model execution.
 
 ### Current limitations
 
-- No authentication, authorization, tenant boundary, rate limiting, CSRF protection, malware scanning, or audit log.
+- Public deployments have a shared demo access gate, but no individual user authentication, authorization, tenant boundary, ownership model, or audit log. SameSite cookies reduce CSRF exposure; there is no independent CSRF token because cross-site cookie mode is intentionally rejected.
 - PDFs use shared S3-compatible object storage, but there is no lifecycle policy, retention class, bucket event audit, or tenant-specific prefix authorization.
 - SQL schema migration is handwritten at startup; there is no Alembic history or rollback.
 - PostgreSQL uses `NullPool`, trading loop safety for connection churn.
@@ -63,7 +65,7 @@ There is no implemented user account, organization, role, or access-control mode
 - Exam generation scrolls all matching chunks, then selects at most twelve deduplicated excerpts round-robin across document/topic groups. Selection is coverage-aware but not semantically ranked.
 - Citation relevance is inferred from reranking; there is no entailment check connecting individual claims to sources.
 - `source_id` is stable only within one response, not across requests.
-- Tests cover twenty-two focused rules and mocked service cases. There are still no real API, worker, database, S3, frontend, load, security, or end-to-end integration tests in the repository.
+- Tests cover twenty-nine focused rules and mocked service cases. There are still no real API, worker, database, S3, frontend, load, penetration, or end-to-end integration tests in the repository.
 
 ## 2. System Architecture
 
@@ -102,7 +104,7 @@ flowchart LR
 
 ### Deployment topology
 
-`docker-compose.yml` starts PostgreSQL, Redis, Qdrant, Neo4j, and MinIO for local development; FastAPI, Celery, and Vite can still run as host processes. `Dockerfile.api` serves API and worker roles, `Dockerfile.frontend` serves the SPA through unprivileged Nginx, and `render.yaml` defines a Render Blueprint for API, worker, frontend, PostgreSQL, and Key Value. Neo4j, Qdrant, and private S3-compatible storage remain external managed dependencies. TLS is delegated to Render. Authentication and network-level tenant isolation are still absent.
+`docker-compose.yml` starts PostgreSQL, Redis, Qdrant, Neo4j, and MinIO for local development; FastAPI, Celery, and Vite can still run as host processes. `Dockerfile.api` serves API and worker roles, `Dockerfile.frontend` serves the SPA through unprivileged Nginx, and `render.yaml` defines a Render Blueprint for API, worker, frontend, PostgreSQL, and Key Value. Neo4j, Qdrant, and private S3-compatible storage remain external managed dependencies. TLS is delegated to Render. A shared demo access code protects the deployed dashboard/API, but user identity, authorization, and network-level tenant isolation remain absent.
 
 ## 3. End-to-End Request Flows
 
@@ -229,8 +231,9 @@ Unlike query retrieval, exam retrieval performs no semantic search. It scrolls e
 | File | Purpose and important symbols | Connections and decisions |
 | --- | --- | --- |
 | `app/main.py` | Creates FastAPI; `lifespan`; `/api/v1/health` | Runs schema initialization before serving; health checks PostgreSQL only; local-development CORS allowlist/regex; closes shared DB clients at shutdown. |
-| `app/core/config.py` | `Settings`, `get_settings`, global `settings` | Loads `.env`; caches settings; constructs asyncpg DSN; defaults expose local development credentials, not production-safe values. |
-| `app/core/database.py` | engines/clients, dependencies, migration, cleanup | Uses async SQLAlchemy + `NullPool`, global async Neo4j driver, synchronous Qdrant client; additive startup DDL; legacy row backfill; no migration version table. |
+| `app/core/config.py` | `Settings`, `get_settings`, global `settings` | Loads `.env`; caches settings; constructs asyncpg DSN; keeps Qdrant/demo tokens as `SecretStr`; validates cookie mode and minimum demo-token length. |
+| `app/core/database.py` | engines/clients, dependencies, migration, cleanup | Uses async SQLAlchemy + `NullPool`, global async Neo4j driver, API-key-aware synchronous Qdrant client; additive startup DDL; legacy row backfill; no migration version table. |
+| `app/core/security.py` | `DemoProtectionMiddleware`, protected/expensive route classification | Validates Bearer or signed-cookie credentials and applies Redis-backed standard/expensive budgets. Health, OPTIONS, and login exchange are exempt. |
 | `app/core/processing.py` | `ProcessingStage`, `FailureCategory`, normalization, classification | Shared lifecycle vocabulary, three-attempt cap, substring-based exception classification. |
 | `app/core/exceptions.py` | `LLMConfigurationError` | Distinguishes absent provider credentials from other runtime errors. |
 | `app/models/document_upload.py` | `Base`, `Course`, `DocumentUpload`, `ProcessingAttempt` | Entire relational domain model. No ORM relationships are declared; services query foreign keys directly. |
@@ -242,6 +245,7 @@ Unlike query retrieval, exam retrieval performs no semantic search. It scrolls e
 | `app/schemas/extraction.py` | Strict graph LLM output: non-empty strings, no extra fields, lists of `ConceptNode` and `ConceptRelationship`. It does not validate that relationship endpoints exist among returned nodes or restrict relationship vocabulary. |
 | `app/schemas/exam.py` | Strict MCQ and exam output. Exactly four options; correct answer must equal one option; extra fields forbidden. It does not ensure unique options, unique questions, citation structure, difficulty, or answer balance. |
 | `app/schemas/ingest.py` | Upload acknowledgment and durable status response contracts. |
+| `app/schemas/auth.py` | Bounded access-code input and session-state response contracts. |
 
 ### Services and worker
 
@@ -256,6 +260,7 @@ Unlike query retrieval, exam retrieval performs no semantic search. It scrolls e
 | `app/services/citation_service.py` | Builds up to four readable, deduplicated source objects. Internal point IDs are omitted, though `document_id` and `metadata.upload_id` are still sent to the frontend. |
 | `app/services/storage_service.py` | S3-compatible PDF put/get/head/delete operations, content-addressed keys, local MinIO support, and constrained legacy-file fallback. |
 | `app/services/synthesis_service.py` | Provider validation, prompt assembly, Groq/Gemini dispatch, weak-evidence fallback, and answer ID sanitization. |
+| `app/services/security_service.py` | Constant-time access-code checks, HMAC-signed expiring cookies, credential fingerprints, and fixed-window Redis counters. |
 | `app/services/exam_service.py` | Filter-only course chunk scrolling, bounded context assembly, provider dispatch, strict JSON parsing and exact-count enforcement. |
 | `app/services/graph_service.py` | Empty placeholder (one line). It implements no behavior. |
 | `app/tasks/document_tasks.py` | Celery application and synchronous task wrapper around one `asyncio.run`. Creates a task-local Neo4j driver; uses fresh SQLAlchemy sessions per stage. |
@@ -265,6 +270,7 @@ Unlike query retrieval, exam retrieval performs no semantic search. It scrolls e
 | File | Routes |
 | --- | --- |
 | `app/api/endpoints/ingest.py` | Upload, status, list, retry, object-backed byte-range preview, and row-locked failed-record deletion. |
+| `app/api/endpoints/auth.py` | Access-code exchange, authenticated session status, and cookie deletion. |
 | `app/api/endpoints/query.py` | `POST /api/v1/query`; readiness → graph/vector retrieval → rerank → citation → synthesis. Cached service factories hold loaded models. |
 | `app/api/endpoints/exam.py` | `POST /api/v1/exam/generate`; shared readiness → course-wide filtered retrieval → structured generation. |
 
@@ -274,9 +280,10 @@ Unlike query retrieval, exam retrieval performs no semantic search. It scrolls e
 | --- | --- |
 | `src/main.tsx` | React root with `StrictMode`. |
 | `src/App.tsx` | Tiny History API router for `/` and `/dashboard`; lazy routes; fixed navigation; application error boundary. There is no React Router dependency. |
+| `src/components/DemoAccessGate.tsx` | Dashboard-only access form, session check, and explicit lock action. The entered secret stays in component memory and is cleared after exchange. |
 | `src/pages/Home.tsx` | Landing-page composition using the animated hero and MacBook visualization. |
 | `src/pages/Dashboard.tsx` | Main state/orchestration component: immutable-ID course selection from course summaries, pending-upload selection handoff, per-course and queue metrics, queue filters/polling/actions, answer/citations, graph transformation, PDF preview. Course changes clear stale answer and graph state. |
-| `src/services/api.ts` | Typed frontend API contracts and `fetchWithTimeout`; defaults to `http://localhost:8000/api/v1`; parses FastAPI `detail`; query/exam timeout 60 s. |
+| `src/services/api.ts` | Typed frontend API/auth contracts and credentialed `fetchWithTimeout`; defaults to `http://localhost:8000/api/v1`; parses FastAPI `detail`; query/exam timeout 60 s. |
 | `src/components/UploadModal.tsx` | Client PDF/course validation, drag/drop, upload request, success/error state. |
 | `src/components/ExamPanel.tsx` | Fixed five-question generation and reveal/hide answer state. |
 | `src/components/ConceptGraphCanvas.tsx` | Cytoscape lifecycle, COSE layout, node details, fit control, and animated incoming-edge traversal. Uses one graph instance and replaces elements on data change. |
@@ -390,6 +397,7 @@ Qdrant supplies approximate nearest-neighbor search and metadata filtering witho
 - Vector size: inferred from the first encoded vector at first collection creation.
 - Default embedding model: `all-MiniLM-L6-v2`, whose standard output dimension is 384. The code does not assert 384; runtime collection size is authoritative.
 - Collection existence race: a 409 “already exists” response is accepted.
+- Cloud authentication: optional `QDRANT_API_KEY` is held as `SecretStr` and supplied to every API/worker `QdrantClient`; local Docker leaves it empty.
 - No quantization, replication, sharding, optimizer, HNSW, WAL, on-disk payload, or consistency options are configured by application code.
 
 ### Point identity and payload
@@ -531,7 +539,11 @@ Important windows:
 
 ## 11. API Reference
 
-All routes are unauthenticated. FastAPI automatically returns 422 for Pydantic or multipart validation errors not explicitly handled.
+With `DEMO_ACCESS_TOKEN` configured, every route below except health and `POST /auth/session` requires either the signed HttpOnly cookie or `Authorization: Bearer <deployment-token>`. Standard and expensive-route rate limits are shared across API replicas through Redis. Without that setting, protection is disabled for local development. FastAPI automatically returns 422 for Pydantic or multipart validation errors not explicitly handled.
+
+### `POST|GET|DELETE /api/v1/auth/session`
+
+POST exchanges a 1–512-character access code for a signed HttpOnly session cookie after a Redis login-attempt check. The configured secret must be at least 24 characters. GET reports the current authenticated session and is protected when the gate is enabled. DELETE expires the cookie. Cookies are host-only, bounded by `AUTH_SESSION_TTL_SECONDS`, and restricted to SameSite `lax` or `strict`; Render sets `Secure=true`. This is shared-secret demo protection, not user identity.
 
 ### `GET /api/v1/health`
 
@@ -561,7 +573,7 @@ Returns `IngestResponse` for a new attempt on the same document. Errors: 404 mis
 
 ### `GET /api/v1/ingest/uploads/{upload_id}/preview`
 
-Streams the original file as `application/pdf` with original filename. Errors: 404 missing row/file. There is no authorization check or page-range endpoint.
+Streams the original file as `application/pdf` with original filename and single-range support. Errors: 404 missing row/file. The global access middleware protects it, but there is no per-document ownership authorization.
 
 ### `DELETE /api/v1/ingest/uploads/{upload_id}`
 
@@ -613,18 +625,21 @@ Maximum attempts are three total, including the original. `mark_failed` clears r
 - Graph relationship labels are sanitized before dynamic Cypher interpolation.
 - Answer prompts exclude raw vector IDs and source paths.
 - LLM keys come from environment-backed settings and are not returned by API code.
+- Qdrant/demo secrets use Pydantic `SecretStr`; Qdrant Cloud authentication is passed directly to the client and never returned by API code.
+- Public demo access uses constant-time secret comparison, a signed expiring HttpOnly cookie, SameSite `lax`/`strict`, and `Secure=true` on Render.
+- Redis-backed counters enforce stricter login and expensive-operation limits across API instances; Redis failure closes protected access with 503.
 - CORS is limited to local development hostnames/ports.
 
 ### Material gaps
 
-- Anyone with network access can upload, query, preview, retry, and delete failed records for every course.
+- Everyone holding the shared deployment access code has equal access to every course and operation; there is no user identity, role, ownership, revocation list, or per-user quota.
 - Database ports are host-published with default development credentials.
 - No TLS or encrypted database connection configuration is present.
 - PDF parsing is performed on untrusted input without process/container sandboxing, malware scanning, decompression-bomb protection beyond byte size, or CPU/page-count limits.
 - Stored PDFs and Qdrant payload source paths are unencrypted.
 - Prompt injection in PDF text is not isolated. System prompts say to stay grounded, but document content can contain adversarial instructions.
 - LLM-generated Cypher is implemented. Although the active retrieval path does not use it, `_validate_read_only_cypher` is a keyword denylist, not a full parser. Read-only resource-exhaustion queries are possible if this path is activated.
-- No request rate limits, per-course quotas, upload quotas, LLM token budgets, or abuse detection.
+- Fixed-window request limits exist, but there are no per-course/upload quotas, LLM token budgets, adaptive abuse detection, or durable security events.
 - Broad local CORS regex allows any port on localhost-like hosts; appropriate for development, not deployment.
 - Errors are logged with exception traces. Whether logs leak provider payload details depends on third-party exception strings and logging configuration, which is not defined in the repository.
 
@@ -700,7 +715,7 @@ Memory worst cases include loading all page chunks for one PDF, encoding them as
 ## 19. Roadmap Ranked by Impact
 
 1. Add integration tests using real PostgreSQL/Qdrant/Neo4j/Redis and a fake deterministic LLM; cover upload through READY, query, exam, retry, duplicate race, and cleanup.
-2. Add authentication, authorization, ownership on courses/documents, and production secret/network configuration.
+2. Replace the shared demo gate with user/org authentication, authorization, ownership on courses/documents, and tenant-scoped storage/vector/graph policies.
 3. Replace startup DDL with Alembic; add `(course_uuid, content_hash)` uniqueness, state/count checks, and Neo4j/Qdrant indexes.
 4. Add an outbox/reconciliation process for broker publication and cross-store orphan detection.
 5. Add object lifecycle/retention rules, quotas, page/CPU limits, malware scanning, ranged provider reads, and an OCR workflow.
@@ -923,7 +938,7 @@ These answers defend the implementation honestly. A strong interview answer shou
 
 80. **How are request timeouts handled?** `AbortController` defaults to 30 seconds; query/exam use 60. Timeout is browser-side only, so server/provider work may continue after disconnection.
 
-81. **Is the application secure for public deployment?** No. It lacks authentication, ownership, TLS configuration, rate limits, hardened secrets, network isolation, and untrusted-PDF sandboxing.
+81. **Is the application secure for a public demo?** It now has a shared access gate, signed Secure/HttpOnly sessions, Redis rate limits, managed-secret inputs, private PDFs, and platform TLS. It is still not a secure multi-tenant product because all code holders share authority and untrusted PDFs are not sandboxed or malware-scanned.
 
 82. **How are secrets loaded?** Pydantic Settings reads environment variables and `.env`. Code references keys but does not print them. Docker database defaults are development credentials.
 
