@@ -104,7 +104,7 @@ Create a backend `.env` file with the following values:
 ```bash
 LLM_PROVIDER=groq
 GROQ_API_KEY=your_groq_api_key
-GROQ_MODEL=llama-3.1-8b-instant
+GROQ_MODEL=openai/gpt-oss-20b
 
 GEMINI_API_KEY=
 GEMINI_MODEL=gemini-1.5-flash
@@ -375,7 +375,7 @@ Run backend rules and frontend production checks with:
 npm run build
 ```
 
-The 29 backend tests cover course normalization and logical duplicate summaries, failure retryability, READY gating, citation deduplication, missing graph endpoints, duplicate relationships, object-storage round trips, legacy reads, cloud database URLs, PDF range responses, Qdrant secret handling, signed-session integrity/expiry, access middleware/cookie exchange, and Redis rate-limit counters.
+The 33 backend tests cover course normalization and logical duplicate summaries, failure retryability, strict graph extraction, READY gating, citation deduplication, missing graph endpoints, duplicate relationships, object-storage round trips, legacy reads, cloud database URLs, PDF range responses, Qdrant secret handling, signed-session integrity/expiry, access middleware/cookie exchange, and Redis rate-limit counters.
 
 ## Notes
 

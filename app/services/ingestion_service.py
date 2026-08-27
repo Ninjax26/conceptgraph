@@ -1,5 +1,4 @@
 import asyncio
-import json
 import re
 from collections.abc import Sequence
 
@@ -8,7 +7,16 @@ from groq import Groq
 from neo4j import AsyncDriver
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import UnexpectedResponse
-from qdrant_client.models import Distance, FieldCondition, Filter, FilterSelector, MatchValue, PointStruct, VectorParams
+from qdrant_client.models import (
+    Distance,
+    FieldCondition,
+    Filter,
+    FilterSelector,
+    MatchValue,
+    PayloadSchemaType,
+    PointStruct,
+    VectorParams,
+)
 from sentence_transformers import SentenceTransformer
 
 from app.core.config import settings
@@ -215,18 +223,37 @@ class IngestionService:
 
     def _ensure_qdrant_collection(self, vector_size: int) -> None:
         existing_collections = self.vector_client.get_collections().collections
-        if any(collection.name == self.collection_name for collection in existing_collections):
-            return
+        collection_exists = any(
+            collection.name == self.collection_name
+            for collection in existing_collections
+        )
+        if not collection_exists:
+            try:
+                self.vector_client.create_collection(
+                    collection_name=self.collection_name,
+                    vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
+                )
+            except UnexpectedResponse as exc:
+                if exc.status_code != 409 and b"already exists" not in exc.content.lower():
+                    raise
 
+        self._ensure_qdrant_payload_indexes()
+
+    def _ensure_qdrant_payload_indexes(self) -> None:
+        collection = self.vector_client.get_collection(self.collection_name)
+        payload_schema = collection.payload_schema or {}
+        if "upload_id" in payload_schema:
+            return
         try:
-            self.vector_client.create_collection(
+            self.vector_client.create_payload_index(
                 collection_name=self.collection_name,
-                vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
+                field_name="upload_id",
+                field_schema=PayloadSchemaType.KEYWORD,
+                wait=True,
             )
         except UnexpectedResponse as exc:
-            if exc.status_code == 409 or b"already exists" in exc.content.lower():
-                return
-            raise
+            if exc.status_code != 409 and b"already exists" not in exc.content.lower():
+                raise
 
     def _extract_with_groq(self, text: str) -> GraphExtractionResponse:
         if not settings.groq_api_key:
@@ -246,7 +273,14 @@ class IngestionService:
                 },
             ],
             temperature=0,
-            response_format={"type": "json_object"},
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "concept_graph_extraction",
+                    "strict": True,
+                    "schema": self._graph_extraction_schema(),
+                },
+            },
         )
         content = completion.choices[0].message.content or "{}"
         return GraphExtractionResponse.model_validate_json(content)
@@ -273,14 +307,48 @@ class IngestionService:
 
     @staticmethod
     def _extraction_system_prompt() -> str:
-        schema = json.dumps(GraphExtractionResponse.model_json_schema(), indent=2)
         return (
             "Extract academic concepts and prerequisite relationships from the text. "
-            "Return only valid JSON matching this schema. Use stable lowercase snake_case "
+            "Return only the requested structured response. Use stable lowercase snake_case "
             "ids for nodes. Use uppercase snake_case relationship types such as "
-            "PREREQUISITE_OF, PART_OF, EXPLAINS, or RELATED_TO.\n\n"
-            f"{schema}"
+            "PREREQUISITE_OF, PART_OF, EXPLAINS, or RELATED_TO. Every relationship "
+            "endpoint must reference an extracted node."
         )
+
+    @staticmethod
+    def _graph_extraction_schema() -> dict[str, object]:
+        # Groq strict mode requires every property to be required and every
+        # object to reject additional properties.
+        concept = {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "name": {"type": "string"},
+                "type": {"type": "string"},
+                "description": {"type": "string"},
+            },
+            "required": ["id", "name", "type", "description"],
+            "additionalProperties": False,
+        }
+        relationship = {
+            "type": "object",
+            "properties": {
+                "source_node_id": {"type": "string"},
+                "target_node_id": {"type": "string"},
+                "relation_type": {"type": "string"},
+            },
+            "required": ["source_node_id", "target_node_id", "relation_type"],
+            "additionalProperties": False,
+        }
+        return {
+            "type": "object",
+            "properties": {
+                "nodes": {"type": "array", "items": concept},
+                "relationships": {"type": "array", "items": relationship},
+            },
+            "required": ["nodes", "relationships"],
+            "additionalProperties": False,
+        }
 
     @staticmethod
     def _resolve_embedding_device() -> str:

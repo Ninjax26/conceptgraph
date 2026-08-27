@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import ANY, AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, Mock, patch
 
 import fitz
 from botocore.exceptions import EndpointConnectionError
@@ -21,6 +21,7 @@ from app.schemas.auth import AccessCodeRequest
 from app.services.citation_service import assess_evidence, build_sources
 from app.services.course_service import CourseNotReadyError, CourseService
 from app.services.exam_service import ExamService
+from app.services.ingestion_service import IngestionService
 from app.services.rag_service import RetrievalService
 from app.services.security_service import DemoAccessService, RateLimitResult, RateLimitService
 from app.services.storage_service import ObjectStorageError, StorageService
@@ -221,6 +222,77 @@ class ProcessingRulesTests(unittest.TestCase):
         category, retryable, _ = classify_failure(RuntimeError("GROQ_API_KEY is not configured"))
         self.assertEqual(category, FailureCategory.CONFIGURATION_ERROR)
         self.assertFalse(retryable)
+
+    def test_unavailable_model_is_a_permanent_configuration_failure(self):
+        category, retryable, message = classify_failure(
+            RuntimeError(
+                "The model `retired-model` does not exist or you do not have access to it."
+            )
+        )
+
+        self.assertEqual(category, FailureCategory.CONFIGURATION_ERROR)
+        self.assertFalse(retryable)
+        self.assertIn("model is unavailable", message)
+
+    def test_existing_qdrant_collection_gets_upload_filter_index(self):
+        vector_client = SimpleNamespace(
+            get_collections=lambda: SimpleNamespace(
+                collections=[SimpleNamespace(name="conceptgraph_chunks")]
+            ),
+            get_collection=lambda name: SimpleNamespace(payload_schema={}),
+            create_payload_index=Mock(),
+        )
+        service = IngestionService(
+            graph_driver=SimpleNamespace(),
+            vector_client=vector_client,
+        )
+
+        service._ensure_qdrant_collection(vector_size=384)
+
+        vector_client.create_payload_index.assert_called_once_with(
+            collection_name="conceptgraph_chunks",
+            field_name="upload_id",
+            field_schema=ANY,
+            wait=True,
+        )
+
+    def test_groq_graph_extraction_uses_strict_json_schema(self):
+        completion = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content='{"nodes": [], "relationships": []}')
+                )
+            ]
+        )
+        client = Mock()
+        client.chat.completions.create.return_value = completion
+        service = IngestionService(
+            graph_driver=SimpleNamespace(),
+            vector_client=SimpleNamespace(),
+        )
+
+        with patch("app.services.ingestion_service.Groq", return_value=client):
+            result = service._extract_with_groq("Course text")
+
+        response_format = client.chat.completions.create.call_args.kwargs[
+            "response_format"
+        ]
+        self.assertEqual(response_format["type"], "json_schema")
+        self.assertTrue(response_format["json_schema"]["strict"])
+        self.assertEqual(
+            set(response_format["json_schema"]["schema"]["required"]),
+            {"nodes", "relationships"},
+        )
+        self.assertEqual(result, GraphExtractionResponse())
+
+    def test_json_schema_provider_failure_is_retryable(self):
+        category, retryable, message = classify_failure(
+            RuntimeError("Groq error code: json_validate_failed")
+        )
+
+        self.assertEqual(category, FailureCategory.PROVIDER_ERROR)
+        self.assertTrue(retryable)
+        self.assertIn("structure", message)
 
     def test_worker_failure_is_retryable(self):
         category, retryable, _ = classify_failure(RuntimeError("worker interrupted"))

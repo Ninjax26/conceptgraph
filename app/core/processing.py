@@ -35,6 +35,15 @@ def normalize_course_name(value: str) -> str:
 
 def classify_failure(exc: Exception) -> tuple[FailureCategory, bool, str]:
     message = str(exc).lower()
+    if "model" in message and any(
+        term in message
+        for term in ("does not exist", "model_not_found", "not found", "do not have access")
+    ):
+        return (
+            FailureCategory.CONFIGURATION_ERROR,
+            False,
+            "The configured AI model is unavailable. Ask an administrator to update the server configuration.",
+        )
     if "api_key" in message or "api key" in message or "not configured" in message or "401" in message:
         return FailureCategory.CONFIGURATION_ERROR, False, "The AI provider is not configured. Ask an administrator to update the server configuration."
     if any(term in message for term in ("password", "encrypted", "malformed", "no extractable text", "no readable text")):
@@ -43,6 +52,8 @@ def classify_failure(exc: Exception) -> tuple[FailureCategory, bool, str]:
         return FailureCategory.DOCUMENT_ERROR, False, "The source PDF is no longer available. Upload it again."
     if any(term in message for term in ("timeout", "timed out", "429", "rate_limit", "temporarily busy")):
         return FailureCategory.TIMEOUT_ERROR, True, "The AI service is temporarily busy. Retry in a minute."
+    if "json_validate_failed" in message:
+        return FailureCategory.PROVIDER_ERROR, True, "The AI provider could not structure the document graph. Please retry."
     if any(
         term in message
         for term in (

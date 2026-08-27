@@ -20,6 +20,8 @@ services:
         value: groq
       - key: GROQ_API_KEY
         sync: false
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-20b
       - key: NEO4J_URI
         sync: false
       - key: NEO4J_USERNAME
@@ -92,6 +94,11 @@ services:
           type: web
           name: conceptgraph-api
           envVarKey: GROQ_API_KEY
+      - key: GROQ_MODEL
+        fromService:
+          type: web
+          name: conceptgraph-api
+          envVarKey: GROQ_MODEL
       - key: NEO4J_URI
         fromService:
           type: web
