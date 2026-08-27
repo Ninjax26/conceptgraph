@@ -375,7 +375,7 @@ Run backend rules and frontend production checks with:
 npm run build
 ```
 
-The 36 backend tests cover course normalization and readiness-aware metrics, logical duplicate summaries, failure retryability, bounded graph-provider recovery, strict graph extraction, READY gating, citation deduplication, missing graph endpoints, duplicate relationships, object-storage round trips, legacy reads, cloud database URLs, PDF range responses, Qdrant secret handling, signed-session integrity/expiry, access middleware/cookie exchange, and Redis rate-limit counters.
+The 38 backend tests cover course normalization and readiness-aware metrics, logical duplicate summaries, failure retryability including Qdrant DNS failures, terminal retry messaging, bounded graph-provider recovery, strict graph extraction, READY gating, citation deduplication, missing graph endpoints, duplicate relationships, object-storage round trips, legacy reads, cloud database URLs, PDF range responses, Qdrant secret handling, signed-session integrity/expiry, access middleware/cookie exchange, and Redis rate-limit counters.
 
 After changing Qdrant clusters, audit legacy READY records before accepting traffic:
 

@@ -62,6 +62,11 @@ def classify_failure(exc: Exception) -> tuple[FailureCategory, bool, str]:
             "qdrant",
             "neo4j",
             "connection",
+            "connecterror",
+            "responsehandlingexception",
+            "nodename nor servname",
+            "name resolution",
+            "dns",
             "object storage",
             "bucket",
         )

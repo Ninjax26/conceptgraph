@@ -295,12 +295,17 @@ class IngestionService:
 
     @staticmethod
     def _graph_extraction_contexts(text: str) -> tuple[str, ...]:
-        contexts = [text]
-        for limit in (3000, 1600):
-            shortened = text[:limit].rsplit("\n", 1)[0].strip()
-            if shortened and shortened != contexts[-1]:
+        contexts: list[str] = []
+        excerpts = [excerpt.strip() for excerpt in text.split("\n\n") if excerpt.strip()]
+        for limit in (1800, 1200, 800):
+            per_excerpt = max(80, limit // max(1, len(excerpts)))
+            shortened = "\n\n".join(
+                excerpt[:per_excerpt].rsplit(" ", 1)[0].strip()
+                for excerpt in excerpts
+            ).strip()
+            if shortened and (not contexts or shortened != contexts[-1]):
                 contexts.append(shortened)
-        return tuple(contexts)
+        return tuple(contexts or [text])
 
     @staticmethod
     def _is_json_validation_failure(exc: BadRequestError) -> bool:

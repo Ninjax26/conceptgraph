@@ -286,7 +286,16 @@ class UploadService:
             return False
         record.status = "failed"
         record.stage = ProcessingStage.FAILED.value
-        record.error_message = error_message
+        retry_limit_reached = (
+            retryable and record.attempt_count >= MAX_PROCESSING_ATTEMPTS
+        )
+        safe_message = (
+            "The retry limit was reached after repeated temporary failures. "
+            "Remove this failed record and upload the PDF again."
+            if retry_limit_reached
+            else error_message
+        )
+        record.error_message = safe_message
         record.failure_category = category.value
         record.retryable = retryable and record.attempt_count < MAX_PROCESSING_ATTEMPTS
         record.completed_at = datetime.now(timezone.utc)
@@ -296,7 +305,7 @@ class UploadService:
             attempt.stage = ProcessingStage.FAILED.value
             attempt.failure_category = category.value
             attempt.retryable = record.retryable
-            attempt.error_message = error_message
+            attempt.error_message = safe_message
             attempt.completed_at = record.completed_at
             attempt.last_heartbeat_at = record.completed_at
         await session.commit()

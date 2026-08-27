@@ -357,6 +357,17 @@ class ProcessingRulesTests(unittest.TestCase):
         self.assertEqual(category, FailureCategory.WORKER_ERROR)
         self.assertTrue(retryable)
 
+    def test_qdrant_dns_failure_is_retryable_storage_error(self):
+        category, retryable, message = classify_failure(
+            RuntimeError(
+                "ResponseHandlingException: nodename nor servname provided, or not known"
+            )
+        )
+
+        self.assertEqual(category, FailureCategory.DATABASE_ERROR)
+        self.assertTrue(retryable)
+        self.assertIn("storage service", message)
+
     def test_citations_deduplicate_and_hide_internal_ids(self):
         chunk = {
             "id": "internal-vector-uuid",
@@ -699,6 +710,33 @@ class ProcessingFencingTests(unittest.TestCase):
 
         self.assertFalse(updated)
         session.commit.assert_not_awaited()
+
+    def test_exhausted_retry_uses_terminal_corrective_action(self):
+        service = UploadService()
+        record = SimpleNamespace(
+            status="active",
+            attempt_count=3,
+        )
+        attempt = SimpleNamespace()
+        service._get_current_upload = AsyncMock(return_value=record)
+        service._current_attempt = AsyncMock(return_value=attempt)
+        session = SimpleNamespace(commit=AsyncMock())
+
+        updated = asyncio.run(
+            service.mark_failed(
+                session,
+                "upload-1",
+                "task-3",
+                "The provider failed. Please retry.",
+                FailureCategory.PROVIDER_ERROR,
+                True,
+            )
+        )
+
+        self.assertTrue(updated)
+        self.assertFalse(record.retryable)
+        self.assertIn("Remove this failed record", record.error_message)
+        self.assertEqual(attempt.error_message, record.error_message)
 
 
 class ReadyContextTests(unittest.TestCase):
