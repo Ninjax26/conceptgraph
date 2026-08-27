@@ -722,6 +722,7 @@ class ReadyContextTests(unittest.TestCase):
                 course_uuid=course.id,
                 content_hash="same-hash",
                 status="ready",
+                stage=ProcessingStage.READY.value,
                 updated_at=now,
                 processed_chunk_count=7,
                 graph_node_count=18,
@@ -732,6 +733,7 @@ class ReadyContextTests(unittest.TestCase):
                 course_uuid=course.id,
                 content_hash="same-hash",
                 status="ready",
+                stage=ProcessingStage.READY.value,
                 updated_at=now,
                 processed_chunk_count=7,
                 graph_node_count=18,
@@ -750,6 +752,35 @@ class ReadyContextTests(unittest.TestCase):
         self.assertEqual(summaries[0].ready_documents, 1)
         self.assertEqual(summaries[0].processed_chunk_count, 7)
         self.assertEqual(summaries[0].duplicate_records, 1)
+
+    def test_course_metrics_exclude_failed_document_artifacts(self):
+        service = CourseService()
+        now = datetime.now(timezone.utc)
+        course = SimpleNamespace(id="course-uuid", display_name="CYBER")
+        failed = SimpleNamespace(
+            upload_id="failed",
+            course_uuid=course.id,
+            content_hash="failed-hash",
+            status="failed",
+            stage=ProcessingStage.FAILED.value,
+            updated_at=now,
+            processed_chunk_count=7,
+            graph_node_count=18,
+            graph_edge_count=14,
+        )
+        courses_result = SimpleNamespace(scalars=lambda: [course])
+        documents_result = SimpleNamespace(scalars=lambda: [failed])
+        session = SimpleNamespace(
+            execute=AsyncMock(side_effect=[courses_result, documents_result])
+        )
+
+        summary = asyncio.run(service.list_summaries(session))[0]
+
+        self.assertEqual(summary.failed_documents, 1)
+        self.assertEqual(summary.ready_documents, 0)
+        self.assertEqual(summary.processed_chunk_count, 0)
+        self.assertEqual(summary.graph_node_count, 0)
+        self.assertEqual(summary.graph_edge_count, 0)
 
 
 class RetryEndpointTests(unittest.TestCase):

@@ -114,7 +114,10 @@ export default function Dashboard(): JSX.Element {
   }, []);
 
   useEffect(() => {
-    if (!courseId || !courses.some((course) => course.course_id === courseId)) {
+    const selectedCourseIsReady = courses.some(
+      (course) => course.course_id === courseId && course.ready_documents > 0,
+    );
+    if (!selectedCourseIsReady) {
       const readyCourse = [...courses]
         .filter((course) => course.ready_documents > 0)
         .sort(
@@ -122,7 +125,7 @@ export default function Dashboard(): JSX.Element {
             Date.parse(right.last_updated_at ?? "") -
             Date.parse(left.last_updated_at ?? ""),
         )[0];
-      if (readyCourse) selectCourse(readyCourse.course_id);
+      selectCourse(readyCourse?.course_id ?? "");
     }
   }, [courseId, courses]);
 

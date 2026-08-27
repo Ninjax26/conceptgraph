@@ -69,16 +69,27 @@ class CourseService:
             ):
                 canonical.setdefault(document.content_hash or document.upload_id, document)
             logical_documents = list(canonical.values())
+            ready_documents = [
+                document
+                for document in logical_documents
+                if document.stage == ProcessingStage.READY.value
+            ]
             summaries.append(
                 CourseSummary(
                     course=course,
                     total_documents=len(logical_documents),
                     active_documents=sum(document.status == "active" for document in logical_documents),
-                    ready_documents=sum(document.status == "ready" for document in logical_documents),
+                    ready_documents=len(ready_documents),
                     failed_documents=sum(document.status == "failed" for document in logical_documents),
-                    processed_chunk_count=sum(document.processed_chunk_count for document in logical_documents),
-                    graph_node_count=sum(document.graph_node_count for document in logical_documents),
-                    graph_edge_count=sum(document.graph_edge_count for document in logical_documents),
+                    processed_chunk_count=sum(
+                        document.processed_chunk_count for document in ready_documents
+                    ),
+                    graph_node_count=sum(
+                        document.graph_node_count for document in ready_documents
+                    ),
+                    graph_edge_count=sum(
+                        document.graph_edge_count for document in ready_documents
+                    ),
                     last_updated_at=max((document.updated_at for document in records), default=None),
                     historical_records=len(records),
                     duplicate_records=len(records) - len(logical_documents),
