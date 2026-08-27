@@ -375,7 +375,7 @@ Run backend rules and frontend production checks with:
 npm run build
 ```
 
-The 33 backend tests cover course normalization and logical duplicate summaries, failure retryability, strict graph extraction, READY gating, citation deduplication, missing graph endpoints, duplicate relationships, object-storage round trips, legacy reads, cloud database URLs, PDF range responses, Qdrant secret handling, signed-session integrity/expiry, access middleware/cookie exchange, and Redis rate-limit counters.
+The 35 backend tests cover course normalization and logical duplicate summaries, failure retryability, bounded graph-provider recovery, strict graph extraction, READY gating, citation deduplication, missing graph endpoints, duplicate relationships, object-storage round trips, legacy reads, cloud database URLs, PDF range responses, Qdrant secret handling, signed-session integrity/expiry, access middleware/cookie exchange, and Redis rate-limit counters.
 
 ## Notes
 

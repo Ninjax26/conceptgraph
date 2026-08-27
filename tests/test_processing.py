@@ -8,8 +8,10 @@ from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, Mock, patch
 
 import fitz
+import httpx
 from botocore.exceptions import EndpointConnectionError
 from fastapi import HTTPException, Request, UploadFile
+from groq import BadRequestError
 from starlette.responses import JSONResponse
 from starlette.datastructures import Headers
 
@@ -293,6 +295,62 @@ class ProcessingRulesTests(unittest.TestCase):
         self.assertEqual(category, FailureCategory.PROVIDER_ERROR)
         self.assertTrue(retryable)
         self.assertIn("structure", message)
+
+    def test_groq_retries_json_validation_with_smaller_context(self):
+        failure = BadRequestError(
+            "Failed to validate JSON",
+            response=httpx.Response(
+                400,
+                request=httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions"),
+            ),
+            body={"error": {"code": "json_validate_failed"}},
+        )
+        completion = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content='{"nodes": [], "relationships": []}')
+                )
+            ]
+        )
+        client = Mock()
+        client.chat.completions.create.side_effect = [failure, completion]
+        service = IngestionService(
+            graph_driver=SimpleNamespace(),
+            vector_client=SimpleNamespace(),
+        )
+
+        with patch("app.services.ingestion_service.Groq", return_value=client):
+            result = service._extract_with_groq("Course text\n" * 500)
+
+        self.assertEqual(client.chat.completions.create.call_count, 2)
+        first_context = client.chat.completions.create.call_args_list[0].kwargs["messages"][1]["content"]
+        second_context = client.chat.completions.create.call_args_list[1].kwargs["messages"][1]["content"]
+        self.assertLess(len(second_context), len(first_context))
+        self.assertEqual(result, GraphExtractionResponse())
+
+    def test_groq_does_not_retry_unrelated_bad_requests(self):
+        failure = BadRequestError(
+            "Invalid request",
+            response=httpx.Response(
+                400,
+                request=httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions"),
+            ),
+            body={"error": {"code": "invalid_request_error"}},
+        )
+        client = Mock()
+        client.chat.completions.create.side_effect = failure
+        service = IngestionService(
+            graph_driver=SimpleNamespace(),
+            vector_client=SimpleNamespace(),
+        )
+
+        with (
+            patch("app.services.ingestion_service.Groq", return_value=client),
+            self.assertRaises(BadRequestError),
+        ):
+            service._extract_with_groq("Course text")
+
+        self.assertEqual(client.chat.completions.create.call_count, 1)
 
     def test_worker_failure_is_retryable(self):
         category, retryable, _ = classify_failure(RuntimeError("worker interrupted"))

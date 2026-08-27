@@ -65,7 +65,7 @@ There is no implemented user account, organization, role, or access-control mode
 - Exam generation scrolls all matching chunks, then selects at most twelve deduplicated excerpts round-robin across document/topic groups. Selection is coverage-aware but not semantically ranked.
 - Citation relevance is inferred from reranking; there is no entailment check connecting individual claims to sources.
 - `source_id` is stable only within one response, not across requests.
-- Tests cover thirty-three focused rules and mocked service cases. There are still no real API, worker, database, S3, frontend, load, penetration, or end-to-end integration tests in the repository.
+- Tests cover thirty-five focused rules and mocked service cases. There are still no real API, worker, database, S3, frontend, load, penetration, or end-to-end integration tests in the repository.
 
 ## 2. System Architecture
 

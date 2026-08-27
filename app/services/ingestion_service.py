@@ -3,7 +3,7 @@ import re
 from collections.abc import Sequence
 
 import torch
-from groq import Groq
+from groq import BadRequestError, Groq
 from neo4j import AsyncDriver
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import UnexpectedResponse
@@ -260,30 +260,56 @@ class IngestionService:
             raise LLMConfigurationError("GROQ_API_KEY is required when LLM_PROVIDER=groq")
 
         client = Groq(api_key=settings.groq_api_key)
-        completion = client.chat.completions.create(
-            model=settings.groq_model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": self._extraction_system_prompt(),
-                },
-                {
-                    "role": "user",
-                    "content": text,
-                },
-            ],
-            temperature=0,
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "concept_graph_extraction",
-                    "strict": True,
-                    "schema": self._graph_extraction_schema(),
-                },
-            },
-        )
-        content = completion.choices[0].message.content or "{}"
-        return GraphExtractionResponse.model_validate_json(content)
+        contexts = self._graph_extraction_contexts(text)
+        for attempt, context in enumerate(contexts):
+            try:
+                completion = client.chat.completions.create(
+                    model=settings.groq_model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": self._extraction_system_prompt(),
+                        },
+                        {
+                            "role": "user",
+                            "content": context,
+                        },
+                    ],
+                    temperature=0,
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "concept_graph_extraction",
+                            "strict": True,
+                            "schema": self._graph_extraction_schema(),
+                        },
+                    },
+                )
+                content = completion.choices[0].message.content or "{}"
+                return GraphExtractionResponse.model_validate_json(content)
+            except BadRequestError as exc:
+                if not self._is_json_validation_failure(exc) or attempt == len(contexts) - 1:
+                    raise
+
+        raise RuntimeError("Graph extraction exhausted its provider attempts.")
+
+    @staticmethod
+    def _graph_extraction_contexts(text: str) -> tuple[str, ...]:
+        contexts = [text]
+        for limit in (3000, 1600):
+            shortened = text[:limit].rsplit("\n", 1)[0].strip()
+            if shortened and shortened != contexts[-1]:
+                contexts.append(shortened)
+        return tuple(contexts)
+
+    @staticmethod
+    def _is_json_validation_failure(exc: BadRequestError) -> bool:
+        body = exc.body
+        if isinstance(body, dict):
+            error = body.get("error")
+            if isinstance(error, dict) and error.get("code") == "json_validate_failed":
+                return True
+        return "json_validate_failed" in str(exc).lower()
 
     def _extract_with_gemini(self, text: str) -> GraphExtractionResponse:
         if not settings.gemini_api_key:
