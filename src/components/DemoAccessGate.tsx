@@ -18,12 +18,14 @@ export default function DemoAccessGate({ children }: DemoAccessGateProps): JSX.E
   const [accessCode, setAccessCode] = useState("");
   const [message, setMessage] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [protectionEnabled, setProtectionEnabled] = useState(false);
 
   useEffect(() => {
     let active = true;
     getAuthSession()
       .then((session) => {
         if (active) {
+          setProtectionEnabled(session.enabled);
           setState(session.authenticated ? "unlocked" : "locked");
         }
       })
@@ -45,6 +47,7 @@ export default function DemoAccessGate({ children }: DemoAccessGateProps): JSX.E
     try {
       const session = await createAuthSession(accessCode);
       if (session.authenticated) {
+        setProtectionEnabled(session.enabled);
         setAccessCode("");
         setState("unlocked");
       }
@@ -75,6 +78,9 @@ export default function DemoAccessGate({ children }: DemoAccessGateProps): JSX.E
   }
 
   if (state === "unlocked") {
+    if (!protectionEnabled) {
+      return <>{children}</>;
+    }
     return (
       <div className="relative">
         <button
