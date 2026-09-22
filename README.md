@@ -1,10 +1,18 @@
 # ConceptGraph
 
-ConceptGraph is an AI-powered academic knowledge graph and GraphRAG pipeline for dense course materials. It ingests syllabi, essays, and textbooks, isolates them by course boundary, and turns them into a searchable concept graph plus a syllabus-bounded retrieval and exam workflow.
+**Ask a question about a course PDF. See the answer, its source pages, and the concepts connecting them.**
+
+ConceptGraph combines page-aware PDF retrieval with a course-scoped concept graph. It is a full-stack exploration of how graph relationships can make source-grounded learning more navigable—not a substitute for checking the original material.
+
+[Jump to setup](#getting-started) · [Read the architecture](#architecture) · [See the tests](#tests)
+
+| Ingest | Connect | Explain |
+| :--- | :--- | :--- |
+| Parse and chunk course PDFs; preserve page provenance. | Store semantic passages in Qdrant and extracted relationships in Neo4j. | Retrieve evidence, show a concept subgraph, cite source pages, and generate practice questions. |
 
 ## Preview
 
-![ConceptGraph dashboard preview](public/dashboard-preview.jpeg)
+![ConceptGraph dashboard showing the course workspace and concept map](public/dashboard-preview.webp)
 
 ## What It Does
 
@@ -99,7 +107,7 @@ This starts:
 
 ### 2. Configure environment variables
 
-Create a backend `.env` file with the following values:
+Copy [`.env.example`](.env.example) to `.env`, then replace the example credentials and add your provider key. The template lists all supported settings:
 
 ```bash
 LLM_PROVIDER=groq
@@ -154,7 +162,8 @@ export OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES
 ### 3. Run the backend
 
 ```bash
-source venv/bin/activate
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
@@ -371,7 +380,7 @@ The current local CYBER dataset contains five historical PostgreSQL rows with on
 Run backend rules and frontend production checks with:
 
 ```bash
-.venv/bin/python -m unittest discover -s tests -v
+python -m unittest discover -s tests -v
 npm run build
 ```
 
